@@ -15,13 +15,20 @@ SOCKET_DIR = os.environ.get("PGTERN_TEST_SOCKET_DIR")
 CA = os.environ.get("PGTERN_TEST_CA")
 
 
+AUTH_ROLES = os.environ.get("PGTERN_TEST_AUTH_ROLES")
+
+
 def pytest_collection_modifyitems(config, items):
-    if DSN:
-        return
-    skip = pytest.mark.skip(reason="set PGTERN_TEST_DSN (see scripts/start-test-postgres.sh)")
-    for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip)
+    if not DSN:
+        skip = pytest.mark.skip(reason="set PGTERN_TEST_DSN (see scripts/start-test-postgres.sh)")
+        for item in items:
+            if "integration" in item.keywords:
+                item.add_marker(skip)
+    if not AUTH_ROLES:
+        skip_auth = pytest.mark.skip(reason="needs the local auth cluster: set PGTERN_TEST_AUTH_ROLES=1")
+        for item in items:
+            if "auth_roles" in item.keywords:
+                item.add_marker(skip_auth)
 
 
 @pytest.fixture(scope="session")

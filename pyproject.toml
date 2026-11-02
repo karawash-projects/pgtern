@@ -41,4 +41,5 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
   "integration: needs a running PostgreSQL (set PGTERN_TEST_DSN, see scripts/start-test-postgres.sh)",
+  "auth_roles: needs the local auth cluster (set PGTERN_TEST_AUTH_ROLES=1)",
 ]

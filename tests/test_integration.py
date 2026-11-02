@@ -24,6 +24,7 @@ pytestmark = pytest.mark.integration
 
 
 # ===================================================================== authentication & TLS
+@pytest.mark.auth_roles
 def test_scram_md5_cleartext_and_trust_authentication():
     for user, pw in (("postgres", "postgres"), ("md5user", "md5pw"), ("clearuser", "clearpw"), ("trustuser", None)):
         with pgtern.connect(url(user, pw, sslmode="disable")) as c:

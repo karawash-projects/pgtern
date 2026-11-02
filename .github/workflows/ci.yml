@@ -56,4 +56,4 @@ jobs:
       - name: Check metadata
         run: |
           python -m twine check --strict dist/*
-          python -c "import zipfile,glob; w=glob.glob('dist/*.whl')[0]; m=zipfile.ZipFile(w).read([n for n in zipfile.ZipFile(w).namelist() if n.endswith('METADATA')][0]).decode(); assert 'Requires-Dist' not in m, 'runtime dependencies found'; print('zero runtime dependencies: ok')"
+          python -c "import zipfile,glob; w=glob.glob('dist/*.whl')[0]; m=zipfile.ZipFile(w).read([n for n in zipfile.ZipFile(w).namelist() if n.endswith('METADATA')][0]).decode(); req = [l for l in m.splitlines() if l.startswith('Requires-Dist') and 'extra ==' not in l]; assert not req, req; print('zero runtime dependencies: ok')"

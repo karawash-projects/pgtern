@@ -98,6 +98,7 @@ def test_server_error_classes_and_connection_survives(dsn):
     run(go())
 
 
+@pytest.mark.auth_roles
 @pytest.mark.parametrize("user,pw", [("md5user", "md5pw"), ("clearuser", "clearpw"), ("postgres", "postgres")])
 def test_auth_methods(user, pw):
     async def go():
@@ -106,6 +107,7 @@ def test_auth_methods(user, pw):
     run(go())
 
 
+@pytest.mark.auth_roles
 def test_trust_and_wrong_password():
     async def go():
         async with await aio.connect(url("trustuser")) as c:
