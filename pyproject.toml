@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pgtern"
+version = "0.3.0"
+description = "A zero-dependency, pure-Python PostgreSQL client with blocking and asyncio APIs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Ahmad Karawash" }]
+keywords = ["postgresql", "postgres", "database", "driver", "dbapi", "scram", "pure-python", "zero-dependency"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Typing :: Typed",
+]
+# Zero runtime dependencies: the standard library is all pgtern needs.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pgtern = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "integration: needs a running PostgreSQL (set PGTERN_TEST_DSN, see scripts/start-test-postgres.sh)",
+]
