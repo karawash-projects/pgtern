@@ -97,5 +97,7 @@ class ScramClient:
             received = base64.b64decode(attrs["v"])
         except (KeyError, ValueError) as exc:
             raise errors.OperationalError("malformed SCRAM server-final-message") from exc
+        if not self._server_signature or not received:
+            raise errors.OperationalError("SCRAM server signature is missing: the server could not be verified")
         if not hmac.compare_digest(received, self._server_signature):
             raise errors.OperationalError("SCRAM server signature does not match: the server could not be verified")

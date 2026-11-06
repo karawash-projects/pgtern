@@ -90,10 +90,14 @@ def test_tls_certificate_verification():
     for mode in ("verify-ca", "verify-full"):
         with pgtern.connect(url("postgres", "postgres", sslmode=mode, sslrootcert=CA)) as c:
             assert _ssl_in_use(c)
+    # verification without any root certificate is a configuration error, raised before connecting
+    for mode in ("verify-ca", "verify-full"):
+        with pytest.raises(pgtern.ProgrammingError, match="sslrootcert"):
+            pgtern.connect(url("postgres", "postgres", sslmode=mode))
     # a self-signed cert is not trusted by the system store
     for mode in ("verify-ca", "verify-full"):
         with pytest.raises(pgtern.OperationalError, match="SSL"):
-            pgtern.connect(url("postgres", "postgres", sslmode=mode))
+            pgtern.connect(url("postgres", "postgres", sslmode=mode, sslrootcert="system"))
     # hostname mismatch: the cert covers localhost and 127.0.0.1, not this name
     with pytest.raises(pgtern.OperationalError, match="SSL"):
         pgtern.connect(f"postgresql://postgres:postgres@127.0.0.2:{PORT}/postgres?sslmode=verify-full&sslrootcert={CA}")

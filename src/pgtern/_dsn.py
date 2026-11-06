@@ -17,7 +17,8 @@ _ENV = {
     "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY", "connect_timeout": "PGCONNECT_TIMEOUT",
     "application_name": "PGAPPNAME", "options": "PGOPTIONS",
 }
-_KNOWN = set(_ENV) | {"database"}
+REQUIRE_AUTH = ("scram-sha-256",)
+_KNOWN = set(_ENV) | {"database", "require_auth"}
 
 
 @dataclass
@@ -33,6 +34,7 @@ class ConnParams:
     connect_timeout: float | None = None
     application_name: str | None = None
     options: str | None = None
+    require_auth: str | None = None
 
 
 def _parse_url(url: str) -> dict[str, str]:
@@ -162,6 +164,17 @@ def build_params(conninfo: str = "", **kwargs: object) -> ConnParams:
     sslmode = values.get("sslmode") or "prefer"
     if sslmode not in SSL_MODES:
         raise errors.ProgrammingError(f"invalid sslmode value {sslmode!r}")
+    sslrootcert = values.get("sslrootcert") or None
+    if sslmode in ("verify-ca", "verify-full") and sslrootcert is None:
+        default_root = os.path.join(os.path.expanduser("~"), ".postgresql", "root.crt")
+        if not os.path.exists(default_root):
+            raise errors.ProgrammingError(
+                f"sslmode={sslmode} needs a root certificate: set sslrootcert to a CA file, "
+                "or to 'system' to trust the system store on purpose")
+        sslrootcert = default_root
+    require_auth = values.get("require_auth") or None
+    if require_auth is not None and require_auth not in REQUIRE_AUTH:
+        raise errors.ProgrammingError(f"invalid require_auth value {require_auth!r}")
     timeout_text = values.get("connect_timeout")
     try:
         timeout = float(timeout_text) if timeout_text else None
@@ -173,10 +186,11 @@ def build_params(conninfo: str = "", **kwargs: object) -> ConnParams:
         password=values.get("password") or None,
         dbname=values.get("dbname") or user,
         sslmode=sslmode,
-        sslrootcert=values.get("sslrootcert") or None,
+        sslrootcert=sslrootcert,
         sslcert=values.get("sslcert") or None,
         sslkey=values.get("sslkey") or None,
         connect_timeout=timeout if timeout and timeout > 0 else None,
         application_name=values.get("application_name") or None,
         options=values.get("options") or None,
+        require_auth=require_auth,
     )

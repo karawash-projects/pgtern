@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import collections
 import enum
-import hashlib
 import itertools
 import logging
 import re
@@ -21,7 +20,7 @@ from . import _protocol as P
 from . import _query, _types, errors, hooks
 from ._cursor import Cursor, ServerCursor
 from ._dsn import ConnParams, build_params
-from ._scram import MECHANISM, ScramClient
+from ._auth import Authenticator
 from .rows import tuple_row
 from .sql import Composable, quote_ident
 
@@ -221,15 +220,18 @@ class Connection:
 
     def _open(self) -> None:
         modes = ["disable", "require"] if self._params.sslmode == "allow" else [self._params.sslmode]
-        last: errors.OperationalError | None = None
+        last: errors.Error | None = None
         for host, port in self._params.hosts:
             for mode in modes:
                 try:
                     self._connect_host(host, port, mode)
                     return
-                except errors.OperationalError as exc:
+                except errors.Error as exc:
                     last = exc
-                    self._drop_socket()
+                except OSError as exc:  # socket timeouts and TLS handshake failures
+                    last = errors.OperationalError(f'connection to server at "{host}", port {port} failed: {exc}')
+                    last.__cause__ = exc
+                self._drop_socket()
         assert last is not None
         raise last
 
@@ -295,11 +297,6 @@ class Connection:
             return sock
         raise errors.OperationalError(f"received an invalid response to the SSL request: {answer!r}")
 
-    def _password(self) -> str:
-        if self._params.password is None:
-            raise errors.OperationalError("the server requested a password, but none was provided")
-        return self._params.password
-
     def _startup(self) -> None:
         p = self._params
         startup = {"user": p.user, "database": p.dbname, "client_encoding": "UTF8", "DateStyle": "ISO"}
@@ -308,33 +305,15 @@ class Connection:
         if p.options:
             startup["options"] = p.options
         self._send(P.startup_message(startup))
-        scram: ScramClient | None = None
+        encrypted = self._tls_mode is not None or self._host.startswith("/")
+        auth = Authenticator(p.user, p.password, encrypted=encrypted, allow_plaintext=p.sslmode == "disable",
+                             require_scram=p.require_auth == "scram-sha-256")
         while True:
             tag, payload = self._next_message()
             if tag == 0x52:  # R Authentication*
-                code = int.from_bytes(payload[:4], "big")
-                if code == 0:
-                    continue
-                if code == 3:
-                    self._send(P.password_message(self._password().encode()))
-                elif code == 5:
-                    inner = hashlib.md5((self._password() + p.user).encode(), usedforsecurity=False).hexdigest()
-                    outer = hashlib.md5(inner.encode() + payload[4:8], usedforsecurity=False).hexdigest()
-                    self._send(P.password_message(b"md5" + outer.encode()))
-                elif code == 10:
-                    mechanisms = [m for m in payload[4:].split(b"\0") if m]
-                    if MECHANISM.encode() not in mechanisms:
-                        raise errors.NotSupportedError(
-                            "the server offers no supported SASL mechanism: "
-                            + ", ".join(m.decode() for m in mechanisms))
-                    scram = ScramClient(self._password())
-                    self._send(P.sasl_initial_response(MECHANISM, scram.client_first()))
-                elif code == 11 and scram is not None:
-                    self._send(P.sasl_response(scram.client_final(payload[4:])))
-                elif code == 12 and scram is not None:
-                    scram.verify_server_final(payload[4:])
-                else:
-                    raise errors.NotSupportedError(f"authentication method {code} is not supported")
+                reply = auth.step(int.from_bytes(payload[:4], "big"), payload[4:])
+                if reply:
+                    self._send(reply)
             elif tag == 0x45:  # E
                 raise errors.error_from_fields(P.parse_error_fields(payload))
             elif tag == 0x53:  # S ParameterStatus

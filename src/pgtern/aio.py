@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import hashlib
 import itertools
 import logging
 import time
@@ -30,7 +29,7 @@ from ._conn import (
 from ._copy import format_row, parse_rows
 from ._cursor import Cursor
 from ._dsn import ConnParams, build_params
-from ._scram import MECHANISM, ScramClient
+from ._auth import Authenticator
 from .pipeline import _enter_hooks, _encode, _exit_hooks, _Item
 from .pool import PoolClosed, PoolTimeout
 from .rows import tuple_row
@@ -401,16 +400,19 @@ class AsyncConnection:
 
     async def _open(self) -> None:
         modes = ["disable", "require"] if self._params.sslmode == "allow" else [self._params.sslmode]
-        last: errors.OperationalError | None = None
+        last: errors.Error | None = None
         for host, port in self._params.hosts:
             for mode in modes:
                 try:
                     await asyncio.wait_for(self._connect_host(host, port, mode), self._params.connect_timeout)
                     return
-                except (errors.OperationalError, asyncio.TimeoutError, OSError) as exc:
-                    self._drop()
-                    last = exc if isinstance(exc, errors.OperationalError) else errors.OperationalError(
+                except errors.Error as exc:
+                    last = exc
+                except (OSError, asyncio.TimeoutError) as exc:
+                    last = errors.OperationalError(
                         f'connection to server at "{host}", port {port} failed: {exc or "timeout expired"}')
+                    last.__cause__ = exc
+                self._drop()
         assert last is not None
         raise last
 
@@ -469,11 +471,6 @@ class AsyncConnection:
         await self._startup()
         self._dates_ok = self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
 
-    def _password(self) -> str:
-        if self._params.password is None:
-            raise errors.OperationalError("the server requested a password, but none was provided")
-        return self._params.password
-
     async def _startup(self) -> None:
         p = self._params
         startup = {"user": p.user, "database": p.dbname, "client_encoding": "UTF8", "DateStyle": "ISO"}
@@ -482,32 +479,15 @@ class AsyncConnection:
         if p.options:
             startup["options"] = p.options
         await self._send(P.startup_message(startup))
-        scram: ScramClient | None = None
+        encrypted = self._tls_mode is not None or self._host.startswith("/")
+        auth = Authenticator(p.user, p.password, encrypted=encrypted, allow_plaintext=p.sslmode == "disable",
+                             require_scram=p.require_auth == "scram-sha-256")
         while True:
             tag, payload = await self._next_message()
-            if tag == 0x52:
-                code = int.from_bytes(payload[:4], "big")
-                if code == 0:
-                    continue
-                if code == 3:
-                    await self._send(P.password_message(self._password().encode()))
-                elif code == 5:
-                    inner = hashlib.md5((self._password() + p.user).encode(), usedforsecurity=False).hexdigest()
-                    outer = hashlib.md5(inner.encode() + payload[4:8], usedforsecurity=False).hexdigest()
-                    await self._send(P.password_message(b"md5" + outer.encode()))
-                elif code == 10:
-                    mechanisms = [m for m in payload[4:].split(b"\0") if m]
-                    if MECHANISM.encode() not in mechanisms:
-                        raise errors.NotSupportedError(
-                            "the server offers no supported SASL mechanism: " + ", ".join(m.decode() for m in mechanisms))
-                    scram = ScramClient(self._password())
-                    await self._send(P.sasl_initial_response(MECHANISM, scram.client_first()))
-                elif code == 11 and scram is not None:
-                    await self._send(P.sasl_response(scram.client_final(payload[4:])))
-                elif code == 12 and scram is not None:
-                    scram.verify_server_final(payload[4:])
-                else:
-                    raise errors.NotSupportedError(f"authentication method {code} is not supported")
+            if tag == 0x52:  # R Authentication*
+                reply = auth.step(int.from_bytes(payload[:4], "big"), payload[4:])
+                if reply:
+                    await self._send(reply)
             elif tag == 0x45:
                 raise errors.error_from_fields(P.parse_error_fields(payload))
             elif tag == 0x4B:

@@ -80,7 +80,7 @@ def test_rowcount_from_command_tag():
 
 # ------------------------------------------------------------------ DSN
 def test_url_with_multiple_hosts_and_escapes():
-    p = _dsn.build_params("postgresql://u:p%40ss@h1:5433,h2/db?sslmode=verify-full&connect_timeout=5")
+    p = _dsn.build_params("postgresql://u:p%40ss@h1:5433,h2/db?sslmode=verify-full&sslrootcert=system&connect_timeout=5")
     assert p.hosts == [("h1", 5433), ("h2", 5432)]
     assert (p.user, p.password, p.dbname, p.sslmode, p.connect_timeout) == ("u", "p@ss", "db", "verify-full", 5.0)
 
