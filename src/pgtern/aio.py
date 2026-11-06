@@ -42,6 +42,38 @@ __all__ = ["connect", "AsyncConnection", "AsyncCursor", "AsyncServerCursor", "As
            "AsyncCopy", "AsyncConnectionPool"]
 
 
+def _buffered(reader: asyncio.StreamReader) -> int:
+    """Bytes the stream has read from the socket but not handed out yet."""
+    return len(getattr(reader, "_buffer", b""))  # asyncio keeps them in a private buffer; there is no public accessor
+
+
+async def _send_cancel_async(host: str, port: int, pid: int, secret: int, tls_mode: str | None,
+                             params: ConnParams) -> None:
+    """Async twin of ``_conn._send_cancel``."""
+    unix = host.startswith("/")
+    try:
+        if unix:
+            reader, writer = await asyncio.open_unix_connection(f"{host}/.s.PGSQL.{port}")
+        else:
+            reader, writer = await asyncio.open_connection(host, port)
+    except OSError as exc:
+        raise errors.OperationalError(f'cancel request: connection to server at "{host}", port {port} failed: {exc}') from exc
+    try:
+        if tls_mode is not None and not unix:
+            writer.write(P.SSL_REQUEST)
+            await writer.drain()
+            if await reader.readexactly(1) != b"S":
+                raise errors.OperationalError("the server refused TLS for the cancel request")
+            await writer.start_tls(_ssl_context(params, tls_mode), server_hostname=host)
+        writer.write(P.cancel_request(pid, secret))
+        await writer.drain()
+        await reader.read(1)  # the server closes the connection once it has handled the request
+    except (OSError, asyncio.IncompleteReadError) as exc:
+        raise errors.OperationalError(f"cancel request failed: {exc}") from exc
+    finally:
+        writer.close()
+
+
 class AsyncCursor(Cursor):
     """Like :class:`pgtern.Cursor`; fetching is in-memory (so synchronous), executing is awaited."""
 
@@ -211,7 +243,7 @@ class AsyncTransaction:
             commit = exc_type is None and not self._force_rollback
             try:
                 if self._savepoint is None:
-                    await conn._simple("COMMIT" if commit else "ROLLBACK")
+                    await (conn._commit_or_fail() if commit else conn._simple("ROLLBACK"))
                 else:
                     sp = quote_ident(self._savepoint)
                     await conn._simple(f"RELEASE {sp}" if commit else f"ROLLBACK TO {sp}; RELEASE {sp}")
@@ -335,6 +367,7 @@ class AsyncConnection:
         self._params = params
         self._autocommit = autocommit
         self.row_factory = row_factory or tuple_row
+        self._default_row_factory = self.row_factory
         self._lock = asyncio.Lock()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -343,6 +376,8 @@ class AsyncConnection:
         self._pending: collections.deque[tuple[int, bytes]] = collections.deque()
         self._server_params: dict[str, str] = {}
         self._backend_pid = 0
+        self._backend_secret = 0
+        self._tls_mode: str | None = None
         self._tx_status = _BROKEN
         self._tx_depth = 0
         self._savepoint_ids = itertools.count(1)
@@ -407,13 +442,19 @@ class AsyncConnection:
         self._parser = P.MessageParser()
         self._pending.clear()
         self._server_params = {}
+        self._tls_mode = None
         if not unix and mode != "disable":
             try:
                 writer.write(P.SSL_REQUEST)
                 await writer.drain()
                 answer = await reader.readexactly(1)
                 if answer == b"S":
+                    if _buffered(reader):
+                        # bytes that arrived right behind the 'S' were never encrypted: never hand them to TLS
+                        self._drop()
+                        raise errors.OperationalError("the server sent unexpected data after its SSL answer")
                     await writer.start_tls(_ssl_context(self._params, mode), server_hostname=host)
+                    self._tls_mode = mode
                 elif answer == b"N":
                     if mode in ("require", "verify-ca", "verify-full"):
                         raise errors.OperationalError("server does not support SSL, but SSL was required")
@@ -471,6 +512,7 @@ class AsyncConnection:
                 raise errors.error_from_fields(P.parse_error_fields(payload))
             elif tag == 0x4B:
                 self._backend_pid = int.from_bytes(payload[:4], "big")
+                self._backend_secret = int.from_bytes(payload[4:8], "big")
             elif tag == 0x5A:
                 self._tx_status = chr(payload[0])
                 return
@@ -529,8 +571,13 @@ class AsyncConnection:
             except (OSError, ConnectionError) as exc:
                 self._mark_broken()
                 raise errors.OperationalError(f"connection failed while receiving: {exc}") from exc
+            except asyncio.CancelledError:
+                # cancelled mid-statement (e.g. a timeout): stop the query on the server, then drop the connection
+                await self._cancel_quietly()
+                self._mark_broken()
+                raise
             except BaseException:
-                self._mark_broken()  # cancelled mid-statement
+                self._mark_broken()
                 raise
             if not data:
                 self._mark_broken()
@@ -904,14 +951,15 @@ class AsyncConnection:
             except BaseException as exc:
                 failure = exc
                 if not self._closed:
+                    # discard the replies still unread, up to the batch's ReadyForQuery (see the blocking twin)
                     try:
                         if not sent_sync:
                             await self._send(P.SYNC)
-                            while True:
-                                tag, payload = await self._next_message()
-                                if tag == 0x5A:
-                                    self._tx_status = chr(payload[0])
-                                    break
+                        while True:
+                            tag, payload = await self._next_message()
+                            if tag == 0x5A:
+                                self._tx_status = chr(payload[0])
+                                break
                         if own_tx and self._tx_status != _IDLE:
                             await self._simple("ROLLBACK")
                     except Exception:
@@ -974,7 +1022,7 @@ class AsyncConnection:
             if self._tx_depth:
                 raise errors.ProgrammingError("explicit commit() is forbidden inside a transaction() block")
             if self._tx_status != _IDLE:
-                await self._simple("COMMIT")
+                await self._commit_or_fail()
 
     async def rollback(self) -> None:
         async with self._lock:
@@ -993,12 +1041,41 @@ class AsyncConnection:
         """Pipeline mode (asyncio). See :mod:`pgtern.pipeline`."""
         return AsyncPipeline(self, batch_size)
 
+    async def cancel(self) -> None:
+        """Ask the server to cancel the statement running on this connection (see ``Connection.cancel``)."""
+        if self._closed or not self._backend_pid:
+            raise errors.OperationalError("the connection is closed")
+        await _send_cancel_async(self._host, self._port, self._backend_pid, self._backend_secret,
+                                 self._tls_mode, self._params)
+
+    async def _cancel_quietly(self) -> None:
+        if self._closed or not self._backend_pid:
+            return
+        try:
+            await asyncio.wait_for(self.cancel(), 2.0)
+        except Exception:  # noqa: BLE001 - best effort: the connection is dropped right after
+            pass
+
+    async def _commit_or_fail(self) -> None:
+        """COMMIT that raises when the server rolled the transaction back instead (it had failed)."""
+        results = await self._simple("COMMIT")
+        if results and results[-1].tag == "ROLLBACK":
+            raise errors.error_from_fields({"S": "ERROR", "C": "25P02", "M": (
+                "the transaction was rolled back, not committed: a statement in it had failed")})
+
     async def _reset_for_pool(self) -> None:
         async with self._lock:
             self._loader_cache.clear()
             self._tx_depth = 0
-            if not self._closed and self._tx_status != _IDLE:
+            if self._closed:
+                return
+            if self._tx_status != _IDLE:
                 await self._simple("ROLLBACK")
+            await self._simple("DISCARD ALL")  # roles, search_path, temp tables, LISTEN, advisory locks, cursors
+            self.row_factory = self._default_row_factory
+            self._notice_handlers.clear()
+            self._notify_handlers.clear()
+            self._notifies.clear()
 
     async def close(self) -> None:
         if self._closed:
@@ -1139,6 +1216,8 @@ class AsyncPipeline:
             for cursor, res in collected:
                 cursor._pipeline_pending = False
                 cursor._set_results(res)
+            if failure is not None:
+                raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
 
     @staticmethod
     async def _read_reply(conn: AsyncConnection) -> tuple[list | None, errors.Error | None]:
@@ -1184,6 +1263,7 @@ class AsyncConnectionPool:
         self.name = name or f"apool-{id(self):x}"
         self._check = check
         self._idle: collections.deque[AsyncConnection] = collections.deque()
+        self._out: set[AsyncConnection] = set()  # checked out and not yet returned
         self._slots: asyncio.Semaphore | None = None
         self._closed = True
         self._default_autocommit = bool(self.kwargs.get("autocommit", False))
@@ -1213,9 +1293,11 @@ class AsyncConnectionPool:
                 conn = self._idle.popleft()
                 if conn._check_alive() and time.monotonic() - conn.created < self.max_lifetime:
                     if await self._passes_check(conn):
+                        self._out.add(conn)
                         return conn
                 await conn.close()
             conn = await asyncio.wait_for(self._new(), wait)
+            self._out.add(conn)
             return conn
         except BaseException:
             self._slots.release()
@@ -1232,6 +1314,9 @@ class AsyncConnectionPool:
 
     async def putconn(self, conn: AsyncConnection) -> None:
         assert self._slots is not None
+        if conn not in self._out:  # a second return would also release a second slot
+            raise errors.ProgrammingError("this connection was not checked out from the pool, or was already returned")
+        self._out.discard(conn)
         try:
             if not self._closed and not conn.closed:
                 try:

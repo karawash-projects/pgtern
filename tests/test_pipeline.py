@@ -63,11 +63,12 @@ def test_cursor_is_not_readable_before_sync(dsn):
 
 def test_error_aborts_rest_of_batch_and_connection_survives_autocommit(dsn, tbl):
     with pgtern.connect(dsn, autocommit=True) as c:
-        with c.pipeline() as pipe:
-            ok = pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'a')")
-            bad = pipe.execute("SELECT 1/0")
-            after = pipe.execute("SELECT 42")
-            # autocommit: the batch is one implicit transaction, so the earlier insert rolls back too
+        # leaving the block raises the first failure; autocommit: the batch is one implicit transaction
+        with pytest.raises(errors.DivisionByZero):
+            with c.pipeline() as pipe:
+                ok = pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'a')")
+                bad = pipe.execute("SELECT 1/0")
+                after = pipe.execute("SELECT 42")
         with pytest.raises(errors.DivisionByZero):
             bad.fetchall()
         with pytest.raises(errors.PipelineAborted):
@@ -79,11 +80,12 @@ def test_error_aborts_rest_of_batch_and_connection_survives_autocommit(dsn, tbl)
 
 def test_sync_points_commit_in_autocommit(dsn, tbl):
     with pgtern.connect(dsn, autocommit=True) as c:
-        with c.pipeline() as pipe:
-            pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'a')")
-            pipe.sync()  # committed here
-            pipe.execute(f"INSERT INTO {tbl} VALUES (2, 'b')")
-            bad = pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'dup')")
+        with pytest.raises(errors.UniqueViolation):
+            with c.pipeline() as pipe:
+                pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'a')")
+                pipe.sync()  # committed here
+                pipe.execute(f"INSERT INTO {tbl} VALUES (2, 'b')")
+                bad = pipe.execute(f"INSERT INTO {tbl} VALUES (1, 'dup')")
         with pytest.raises(errors.UniqueViolation):
             bad.fetchall()
         assert c.execute(f"SELECT array_agg(v ORDER BY v) FROM {tbl}").fetchone() == ([1],)
@@ -91,10 +93,11 @@ def test_sync_points_commit_in_autocommit(dsn, tbl):
 
 def test_non_autocommit_wraps_batch_in_one_transaction(dsn, tbl):
     with pgtern.connect(dsn) as c:
-        with c.pipeline() as pipe:
-            pipe.execute(f"INSERT INTO {tbl} VALUES (5, 'x')")
-            pipe.execute(f"INSERT INTO {tbl} VALUES (6, 'y')")
-            bad = pipe.execute("SELECT 1/0")
+        with pytest.raises(errors.DivisionByZero):
+            with c.pipeline() as pipe:
+                pipe.execute(f"INSERT INTO {tbl} VALUES (5, 'x')")
+                pipe.execute(f"INSERT INTO {tbl} VALUES (6, 'y')")
+                bad = pipe.execute("SELECT 1/0")
         with pytest.raises(errors.DivisionByZero):
             bad.fetchall()
         assert c.info.transaction_status.name == "INERROR"
@@ -212,10 +215,11 @@ def test_async_pipeline_order_errors_and_batches(dsn):
                 hs = [await pipe.execute("SELECT %s::int", [i]) for i in range(10)]
             assert [h.fetchall() for h in hs] == [[(i,)] for i in range(10)]
 
-            async with c.pipeline() as pipe:
-                ok = await pipe.execute("SELECT 1")
-                bad = await pipe.execute("SELECT 1/0")
-                after = await pipe.execute("SELECT 2")
+            with pytest.raises(errors.DivisionByZero):
+                async with c.pipeline() as pipe:
+                    ok = await pipe.execute("SELECT 1")
+                    bad = await pipe.execute("SELECT 1/0")
+                    after = await pipe.execute("SELECT 2")
             assert ok.fetchall() == [(1,)]
             with pytest.raises(errors.DivisionByZero):
                 bad.fetchall()

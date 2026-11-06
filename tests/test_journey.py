@@ -114,6 +114,7 @@ def test_02_migrations_applied_exactly_once(env, tenants):
         with pytest.raises(errors.UniqueViolation) as ei:
             c.execute("INSERT INTO schema_migrations (version) VALUES (1)")
         assert ei.value.diag.constraint_name == "schema_migrations_pkey"
+        c.rollback()
 
 
 def _as_tenant(conn, tenant_id):
@@ -147,7 +148,8 @@ def test_03_crud_with_all_types_under_rls(env, tenants):
             _as_tenant(c, globex)
             assert c.execute("SELECT count(*) AS n FROM items").fetchone()["n"] == 0  # acme's rows are invisible
             with pytest.raises(errors.InsufficientPrivilege):  # WITH CHECK blocks writing into another tenant
-                c.execute("INSERT INTO items (tenant_id, title) VALUES (%s, 'sneaky')", [acme])
+                with c.transaction():  # a savepoint: the failure stays inside it
+                    c.execute("INSERT INTO items (tenant_id, title) VALUES (%s, 'sneaky')", [acme])
         with c.transaction():
             assert c.execute("SELECT count(*) AS n FROM items").fetchone()["n"] == 0  # no tenant set: nothing visible
         with c.transaction():
@@ -324,6 +326,7 @@ def test_09_observability_hooks_never_see_parameters(env, tenants):
             c.execute(sql.SQL("SELECT {}").format(sql.Literal("another-secret")))
             with pytest.raises(errors.UndefinedTable):
                 c.execute("SELECT * FROM missing_zz")
+            c.rollback()
     finally:
         remove()
     blob = repr(seen)

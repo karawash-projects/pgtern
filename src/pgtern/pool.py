@@ -61,6 +61,7 @@ class ConnectionPool:
         self._default_autocommit = bool(self.kwargs.get("autocommit", False))
         self._cond = threading.Condition()
         self._idle: collections.deque[_Idle] = collections.deque()
+        self._out: set[Connection] = set()  # checked out and not yet returned
         self._n = 0            # open + being opened
         self._connecting = 0
         self._waiting = 0
@@ -241,6 +242,8 @@ class ConnectionPool:
                     continue
             if candidate is not None:
                 if self._usable(candidate.conn):
+                    with self._cond:
+                        self._out.add(candidate.conn)
                     return candidate.conn
                 self._discard(candidate.conn)
                 continue
@@ -266,9 +269,16 @@ class ConnectionPool:
             if closed:
                 conn.close()
                 raise PoolClosed("the pool is closed")
+            with self._cond:
+                self._out.add(conn)
             return conn
 
     def putconn(self, conn: Connection) -> None:
+        with self._cond:
+            if conn not in self._out:
+                raise errors.ProgrammingError(
+                    "this connection was not checked out from the pool, or was already returned")
+            self._out.discard(conn)
         ok = not conn.closed
         if ok:
             try:

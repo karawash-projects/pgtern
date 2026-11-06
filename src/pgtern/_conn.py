@@ -108,6 +108,34 @@ def _ssl_context(params: ConnParams, mode: str) -> ssl.SSLContext:
     return ctx
 
 
+def _send_cancel(host: str, port: int, pid: int, secret: int, tls_mode: str | None,
+                 params: ConnParams) -> None:
+    """Send a CancelRequest on a new connection. TLS is used when the original connection used it,
+    so the secret key never travels in clear text."""
+    unix = host.startswith("/")
+    try:
+        if unix:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(params.connect_timeout)
+            sock.connect(f"{host}/.s.PGSQL.{port}")
+        else:
+            sock = socket.create_connection((host, port), timeout=params.connect_timeout)
+    except OSError as exc:
+        raise errors.OperationalError(f'cancel request: connection to server at "{host}", port {port} failed: {exc}') from exc
+    try:
+        if tls_mode is not None and not unix:
+            sock.sendall(P.SSL_REQUEST)
+            if sock.recv(1) != b"S":
+                raise errors.OperationalError("the server refused TLS for the cancel request")
+            sock = _ssl_context(params, tls_mode).wrap_socket(sock, server_hostname=host)
+        sock.sendall(P.cancel_request(pid, secret))
+        sock.recv(1)  # the server closes the connection once it has handled the request
+    except (OSError, ssl.SSLError) as exc:
+        raise errors.OperationalError(f"cancel request failed: {exc}") from exc
+    finally:
+        sock.close()
+
+
 class Transaction:
     """``with conn.transaction():`` BEGIN/COMMIT, or SAVEPOINT/RELEASE when already in a transaction."""
 
@@ -141,7 +169,7 @@ class Transaction:
             commit = exc_type is None and not self._force_rollback
             try:
                 if self._savepoint is None:
-                    conn._simple("COMMIT" if commit else "ROLLBACK")
+                    conn._commit_or_fail() if commit else conn._simple("ROLLBACK")
                 else:
                     sp = quote_ident(self._savepoint)
                     conn._simple(f"RELEASE {sp}" if commit else f"ROLLBACK TO {sp}; RELEASE {sp}")
@@ -160,6 +188,7 @@ class Connection:
         self._params = params
         self._autocommit = autocommit
         self.row_factory = row_factory or tuple_row
+        self._default_row_factory = self.row_factory
         self._lock = threading.RLock()
         self._sock: socket.socket | None = None
         self._closed = True
@@ -167,6 +196,8 @@ class Connection:
         self._pending: collections.deque[tuple[int, bytes]] = collections.deque()
         self._server_params: dict[str, str] = {}
         self._backend_pid = 0
+        self._backend_secret = 0
+        self._tls_mode: str | None = None
         self._tx_status = _BROKEN
         self._tx_stack: list[Transaction] = []
         self._savepoint_ids = itertools.count(1)
@@ -234,6 +265,7 @@ class Connection:
         self._parser = P.MessageParser()
         self._pending.clear()
         self._server_params = {}
+        self._tls_mode = None
         if not unix and mode != "disable":
             try:
                 self._sock = self._negotiate_tls(sock, host, mode)
@@ -243,6 +275,7 @@ class Connection:
                     return self._connect_host(host, port, "disable")
                 raise errors.OperationalError(
                     f'SSL connection to server at "{host}", port {port} failed: {exc}') from exc
+        self._tls_mode = mode if isinstance(self._sock, ssl.SSLSocket) else None
         try:
             self._startup()
         except socket.timeout as exc:  # pragma: no cover - mapped in _recv
@@ -309,6 +342,7 @@ class Connection:
                 self._server_params[name] = value
             elif tag == 0x4B:  # K BackendKeyData
                 self._backend_pid = int.from_bytes(payload[:4], "big")
+                self._backend_secret = int.from_bytes(payload[4:8], "big")
             elif tag == 0x4E:  # N
                 self._notice(payload)
             elif tag == 0x5A:  # Z ReadyForQuery
@@ -602,15 +636,16 @@ class Connection:
             except BaseException as exc:
                 failure = exc
                 if self._sock is not None:
-                    # a bad parameter or a dropped socket mid-batch: end the batch so the connection stays usable
+                    # a bad parameter, a failing hook or a dropped socket mid-batch: discard the replies that are
+                    # still unread, up to the batch's ReadyForQuery, so none of them can reach a later query
                     try:
                         if not sent_sync:
                             self._send(P.SYNC)
-                            while True:
-                                tag, payload = self._next_message()
-                                if tag == 0x5A:
-                                    self._tx_status = chr(payload[0])
-                                    break
+                        while True:
+                            tag, payload = self._next_message()
+                            if tag == 0x5A:
+                                self._tx_status = chr(payload[0])
+                                break
                         if own_tx and self._tx_status != _IDLE:
                             self._simple("ROLLBACK")
                     except Exception:
@@ -829,6 +864,13 @@ class Connection:
                 raise errors.ProgrammingError("can't change 'autocommit' now: connection in a transaction")
             self._autocommit = bool(value)
 
+    def _commit_or_fail(self) -> None:
+        """COMMIT that raises when the server rolled the transaction back instead (it had failed)."""
+        results = self._simple("COMMIT")
+        if results and results[-1].tag == "ROLLBACK":
+            raise errors.error_from_fields({"S": "ERROR", "C": "25P02", "M": (
+                "the transaction was rolled back, not committed: a statement in it had failed")})
+
     def commit(self) -> None:
         with self._lock:
             self._check_open()
@@ -838,7 +880,7 @@ class Connection:
                     "explicit commit() is forbidden inside a transaction() block; "
                     "the block commits on a successful exit")
             if self._tx_status != _IDLE:
-                self._simple("COMMIT")
+                self._commit_or_fail()
 
     def rollback(self) -> None:
         with self._lock:
@@ -858,12 +900,30 @@ class Connection:
         from .pipeline import Pipeline
         return Pipeline(self, batch_size)
 
+    def cancel(self) -> None:
+        """Ask the server to cancel the statement running on this connection.
+
+        Safe to call from another thread while a query runs: it opens its own connection to the
+        server and neither waits for nor takes the lock of the query in progress."""
+        pid, secret = self._backend_pid, self._backend_secret
+        if self._closed or not pid:
+            raise errors.OperationalError("the connection is closed")
+        _send_cancel(self._host, self._port, pid, secret, self._tls_mode, self._params)
+
     def _reset_for_pool(self) -> None:
+        """Return the session to its initial state, so the next borrower sees nothing of this one."""
         with self._lock:
             self._loader_cache.clear()
             self._tx_stack.clear()
-            if not self._closed and self._tx_status != _IDLE:
+            if self._closed:
+                return
+            if self._tx_status != _IDLE:
                 self._simple("ROLLBACK")
+            self._simple("DISCARD ALL")  # roles, search_path, temp tables, LISTEN, advisory locks, cursors
+            self.row_factory = self._default_row_factory
+            self._notice_handlers.clear()
+            self._notify_handlers.clear()
+            self._notifies.clear()
 
     def close(self) -> None:
         with self._lock:

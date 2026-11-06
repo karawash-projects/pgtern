@@ -145,7 +145,7 @@ with pgtern.connect(dsn) as conn:
     print(b.fetchone())    # results are ready once the block ends
 ```
 
-Statements are read in order at each sync point (`pipe.sync()`, the end of the block, or every `batch_size` statements). With `autocommit=True` a sync point is a commit point, so the statements in one batch succeed or fail together. Statements after a failure are skipped and raise `pgtern.errors.PipelineAborted`.
+Statements are read in order at each sync point (`pipe.sync()`, the end of the block, or every `batch_size` statements). A sync point raises the first failure in its batch, so a failed statement cannot pass silently. With `autocommit=True` a sync point is a commit point, so the statements in one batch succeed or fail together. Statements after a failure are skipped and raise `pgtern.errors.PipelineAborted`.
 
 ## Custom types
 
@@ -209,7 +209,7 @@ with pgtern.connect(dsn) as conn:
     try:
         conn.execute("INSERT INTO accounts (id) VALUES (%s)", [1])
     except pgtern.IntegrityError:
-        ...
+        conn.rollback()  # a failed transaction must be rolled back before the block ends
 ```
 
 ## Compatibility

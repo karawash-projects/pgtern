@@ -112,6 +112,11 @@ def copy_data(data: bytes) -> bytes:
     return _msg(b"d", data)
 
 
+def cancel_request(pid: int, secret: int) -> bytes:
+    """CancelRequest: sent on a new connection to stop the statement running on backend ``pid``."""
+    return struct.pack("!IIII", 16, 80877102, pid, secret)
+
+
 COPY_DONE = _msg(b"c", b"")
 TERMINATE = _msg(b"X", b"")
 

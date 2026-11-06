@@ -15,8 +15,9 @@ statements.
   implicit BEGIN, as usual. With ``autocommit=True`` every sync point is a commit point, so
   statements in one batch succeed or fail together. Use ``batch_size`` or ``sync()`` to choose.
 * Errors: when one statement fails the server skips the rest of the batch. Those statements
-  get :class:`pgtern.errors.PipelineAborted`, and the failing statement raises its own error
-  when read. Inside a transaction you must roll back afterwards, as with any failure.
+  get :class:`pgtern.errors.PipelineAborted`. A sync point raises the first error of its batch,
+  and the failing statement's cursor holds the same error. Inside a transaction you must roll back
+  afterwards, as with any failure.
 * Only text format is used (``binary=True`` is not available in pipelines).
 """
 from __future__ import annotations
@@ -180,6 +181,8 @@ class Pipeline:
             for cursor, res in collected:
                 cursor._pipeline_pending = False
                 cursor._set_results(res)
+            if failure is not None:
+                raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
 
     @staticmethod
     def _read_reply(conn: Any) -> tuple[list | None, errors.Error | None]:

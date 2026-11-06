@@ -315,12 +315,13 @@ def test_force_rollback_and_error_state(aconn, table):
     with aconn.transaction(force_rollback=True):
         aconn.execute(f"INSERT INTO {table} (name) VALUES ('ghost')")
     assert aconn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
-    with aconn.transaction():
-        with pytest.raises(errors.DivisionByZero):
-            aconn.execute("SELECT 1/0")
-        assert aconn.info.transaction_status is pgtern.TransactionStatus.INERROR
-        with pytest.raises(errors.InFailedSqlTransaction):
-            aconn.execute("SELECT 1")
+    with pytest.raises(errors.InFailedSqlTransaction):  # leaving the block after an error is not a commit
+        with aconn.transaction():
+            with pytest.raises(errors.DivisionByZero):
+                aconn.execute("SELECT 1/0")
+            assert aconn.info.transaction_status is pgtern.TransactionStatus.INERROR
+            with pytest.raises(errors.InFailedSqlTransaction):
+                aconn.execute("SELECT 1")
     assert aconn.execute("SELECT 1").fetchone() == (1,)
 
 
@@ -360,6 +361,7 @@ def test_constraint_errors_carry_diagnostics(table, conn):
     conn.rollback()
     with pytest.raises(errors.CheckViolation):
         conn.execute(f"INSERT INTO {table} (name, n) VALUES ('b', -1)")
+    conn.rollback()
 
 
 def test_error_classes_for_common_mistakes(aconn):
@@ -389,6 +391,7 @@ def test_insufficient_privilege_for_a_plain_role(dsn):
             with pytest.raises(errors.InsufficientPrivilege) as exc:
                 c.execute("SELECT * FROM pg_authid")
             assert exc.value.sqlstate == "42501"
+            c.rollback()
     finally:
         with pgtern.connect(dsn, autocommit=True) as owner:
             owner.execute("DROP ROLE IF EXISTS pgtern_plain")

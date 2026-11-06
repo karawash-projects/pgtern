@@ -218,7 +218,8 @@ def test_server_cursor_name_collision_and_no_transaction(aconn):
         c1 = aconn.cursor("dup")
         c1.execute("SELECT 1")
         with pytest.raises(errors.DuplicateCursor):
-            aconn.cursor("dup").execute("SELECT 2")
+            with aconn.transaction():  # a savepoint: the failure stays inside it, the outer block stays healthy
+                aconn.cursor("dup").execute("SELECT 2")
 
 
 def test_server_cursor_withhold_survives_commit(conn):
