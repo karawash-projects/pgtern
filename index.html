@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pgtern: PostgreSQL client for Python</title>
+<meta name="description" content="pgtern is a zero-dependency PostgreSQL client for Python with blocking and asyncio APIs.">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6474; --accent: #2563eb;
+    --code-bg: #f3f5f9; --border: #e2e6ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1420; --fg: #e6e9f0; --muted: #9aa4b5; --accent: #7aa7ff;
+      --code-bg: #1a2130; --border: #2a3345;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1420; --fg: #e6e9f0; --muted: #9aa4b5; --accent: #7aa7ff;
+    --code-bg: #1a2130; --border: #2a3345;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 16px 64px; }
+  h1 { font-size: 2.4rem; margin: 0 0 8px; }
+  h2 { font-size: 1.4rem; margin: 40px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  p.lead { font-size: 1.15rem; color: var(--muted); margin: 0 0 24px; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92rem; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 6px 0; }
+  .badges { margin: 0 0 16px; }
+  .links { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 24px 0 0; padding: 0; list-style: none; }
+  .links a { font-weight: 600; text-decoration: none; }
+  .links a:hover { text-decoration: underline; }
+  .status { border-left: 4px solid var(--accent); background: var(--code-bg); padding: 10px 14px; border-radius: 6px; }
+  footer { margin-top: 56px; color: var(--muted); font-size: 0.9rem; border-top: 1px solid var(--border); padding-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pgtern</h1>
+  <p class="lead">A PostgreSQL client for Python with zero runtime dependencies. Blocking and <code>asyncio</code> APIs, pure Python, standard library only.</p>
+
+  <p class="status"><strong>Status: Beta.</strong> pgtern is at version 0.x, and the API may change before 1.0. See the <a href="https://github.com/karawash-projects/pgtern/blob/main/CHANGELOG.md">changelog</a>.</p>
+
+  <h2>Install</h2>
+  <pre><code>pip install pgtern</code></pre>
+  <p>Requires Python 3.11 or newer.</p>
+
+  <h2>Quick start</h2>
+  <pre><code>import pgtern
+from pgtern.rows import dict_row
+
+with pgtern.connect("postgresql://app:secret@localhost/app", row_factory=dict_row) as conn:
+    with conn.transaction():
+        conn.execute("INSERT INTO notes (body) VALUES (%s)", ["hello"])
+    print(conn.execute("SELECT id, body FROM notes ORDER BY id").fetchall())</code></pre>
+
+  <h2>Async</h2>
+  <pre><code>import asyncio
+from pgtern import aio
+
+async def main():
+    async with aio.AsyncConnectionPool("postgresql://app:secret@localhost/app", min_size=2, max_size=10) as pool:
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT %s::int", [1])
+            print(cur.fetchall())
+
+asyncio.run(main())</code></pre>
+
+  <h2>Features</h2>
+  <ul>
+    <li>No runtime dependencies, and no C extensions or build step.</li>
+    <li>Blocking and <code>asyncio</code> APIs with the same names and behaviour.</li>
+    <li>SCRAM-SHA-256 authentication, with channel binding over TLS.</li>
+    <li>TLS modes from <code>disable</code> to <code>verify-full</code>.</li>
+    <li>Connection pools with liveness checks and a fork-safe reset.</li>
+    <li>Parameters are always sent separately from the SQL text.</li>
+    <li>Server-side cursors, batched <code>executemany</code>, <code>COPY</code>, pipelines and notifications.</li>
+    <li>Query hooks for logging and tracing, without bound parameter values.</li>
+  </ul>
+
+  <h2>Compatibility</h2>
+  <ul>
+    <li>PostgreSQL 14, 15, 16, 17 and 18.</li>
+    <li>Python 3.11, 3.12 and 3.13, tested in continuous integration on Linux.</li>
+  </ul>
+
+  <ul class="links">
+    <li><a href="https://pypi.org/project/pgtern/">PyPI</a></li>
+    <li><a href="https://github.com/karawash-projects/pgtern">Source</a></li>
+    <li><a href="https://github.com/karawash-projects/pgtern/blob/main/README.md">Full README</a></li>
+    <li><a href="https://github.com/karawash-projects/pgtern/blob/main/CHANGELOG.md">Changelog</a></li>
+    <li><a href="https://github.com/karawash-projects/pgtern/issues">Issues</a></li>
+    <li><a href="https://github.com/karawash-projects/pgtern/blob/main/SECURITY.md">Security policy</a></li>
+  </ul>
+
+  <footer>pgtern is licensed under the Apache License 2.0.</footer>
+</main>
+</body>
+</html>
