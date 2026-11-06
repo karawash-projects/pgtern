@@ -1,0 +1,60 @@
+site_name: pgtern
+site_url: https://karawash-projects.github.io/pgtern/
+site_description: A zero-dependency PostgreSQL client for Python, with blocking and asyncio APIs.
+repo_url: https://github.com/karawash-projects/pgtern
+repo_name: karawash-projects/pgtern
+copyright: Apache License 2.0
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+extra:
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Connecting: getting-started/connecting.md
+      - First query: getting-started/first-query.md
+  - Guide:
+      - Queries and transactions: guide/queries.md
+      - Bulk loading: guide/bulk-loading.md
+      - Streaming large results: guide/streaming.md
+      - Notifications: guide/notifications.md
+      - Pipelines: guide/pipelines.md
+      - Values and types: guide/types.md
+      - Binary format: guide/binary.md
+      - Connection pools: guide/pools.md
+      - Query hooks: guide/hooks.md
+      - Errors: guide/errors.md
+  - Operations:
+      - Security and TLS: operations/security.md
+      - Limits and safety: operations/limits.md
+      - Forking: operations/forking.md
+  - More:
+      - Compatibility: more/compatibility.md
+      - Development: more/development.md
+      - Contributing: more/contributing.md
+      - Security policy: more/security-policy.md
+      - License: more/license.md
