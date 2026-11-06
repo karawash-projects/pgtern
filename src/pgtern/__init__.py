@@ -24,7 +24,7 @@ from .errors import (
 from .hooks import QueryInfo, add_query_hook
 from .pool import ConnectionPool, PoolClosed, PoolTimeout
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # DB-API 2.0 module globals
 apilevel = "2.0"
