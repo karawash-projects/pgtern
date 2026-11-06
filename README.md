@@ -52,7 +52,7 @@ Requires Python 3.11 or newer.
 conn = pgtern.connect("postgresql://app@db1.internal,db2.internal/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem")
 ```
 
-TLS modes follow the PostgreSQL convention: `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`. Authentication supports SCRAM-SHA-256, MD5, cleartext and trust. Under `allow` and `prefer` the client refuses MD5 and cleartext passwords on an unencrypted connection; under `disable` it sends them, because you asked for no encryption. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including trust. Failover moves to the next host on any startup failure, including timeouts during TLS negotiation.
+TLS modes follow the PostgreSQL convention: `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`. Authentication supports SCRAM-SHA-256, MD5, cleartext and trust. Under `allow` and `prefer` the client refuses MD5 and cleartext passwords on an unencrypted connection; under `disable` it sends them, because you asked for no encryption. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including trust. Failover moves to the next host on any startup failure, including timeouts during TLS negotiation. Passwords can come from a `.pgpass` file (`PGPASSFILE` or `~/.pgpass`); a file readable by other users is ignored, as the PostgreSQL client tools do. `target_session_attrs` (`read-write`, `read-only`, `primary`, `standby`, `prefer-standby`) skips servers that do not match, `hostaddr` connects to an address while keeping the host name for certificate checks, and `sslpassword` and `sslcrl` are supported.
 
 ## Queries and transactions
 
@@ -131,6 +131,16 @@ with pgtern.connect(dsn) as conn:
 
 The asyncio connection supports `async for` over the same notifications. Session features such as `LISTEN` run on a direct or session-mode connection.
 
+## Values
+
+Python `int` parameters are sent as `int4`, `int8` or `numeric` by size. A `smallint` parameter is never inferred from a Python int, so use an explicit cast (`%s::smallint`) for a function that only takes `smallint`.
+
+An interval with months or years decodes to `pgtern.Interval(months, delta)`, because a month is not a fixed number of days. Intervals without months decode to `timedelta`, as before.
+
+## Forking
+
+A connection or pool must not be used across `fork()`. A forked child that uses an inherited connection gets `OperationalError`. A forked child that uses an inherited pool gets its own new connections, and never shares the parent's sockets.
+
 ## Binary format and pipelines
 
 Opt into binary transfer per statement with `binary=True`. It covers integers, floats, booleans, text, bytea, uuid, dates and times, intervals, json/jsonb, numeric results and one-dimensional arrays of these. Other types keep using text.
@@ -145,7 +155,7 @@ with pgtern.connect(dsn) as conn:
     print(b.fetchone())    # results are ready once the block ends
 ```
 
-Statements are read in order at each sync point (`pipe.sync()`, the end of the block, or every `batch_size` statements). A sync point raises the first failure in its batch, so a failed statement cannot pass silently. With `autocommit=True` a sync point is a commit point, so the statements in one batch succeed or fail together. Statements after a failure are skipped and raise `pgtern.errors.PipelineAborted`.
+Statements are read in order at each sync point (`pipe.sync()`, the end of the block, or every `batch_size` statements). A sync point raises the first failure in its batch, so a failed statement cannot pass silently. With `autocommit=True` a sync point is a commit point, so the statements in one batch succeed or fail together. Statements after a failure are skipped and raise `pgtern.errors.PipelineAborted`. If the block exits with an exception under autocommit, the batch is rolled back, not committed. COPY cannot be used inside a pipeline or executemany.
 
 ## Custom types
 
@@ -176,7 +186,7 @@ with pool.connection() as conn:
     conn.execute("SELECT 1")
 ```
 
-Pools keep `min_size` connections warm and grow to `max_size` on demand. A connection is checked for liveness each time it is handed out, rolled back if it comes back mid-transaction, and replaced when the server has closed it. Waiting callers receive `pgtern.PoolTimeout` after `timeout` seconds.
+Pools keep `min_size` connections warm and grow to `max_size` on demand. The async pool keeps `min_size` open with a background task, and retires connections idle longer than `max_idle`. A connection is checked for liveness each time it is handed out, rolled back if it comes back mid-transaction, and replaced when the server has closed it. Waiting callers receive `pgtern.PoolTimeout` after `timeout` seconds.
 
 ## Observability
 

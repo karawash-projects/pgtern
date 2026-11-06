@@ -17,6 +17,7 @@ from . import errors
 from ._types import (
     BOOL, BPCHAR, BYTEA, CHAR, DATE, ELEMENT_OF, FLOAT4, FLOAT8, INT2, INT4, INT8, INTERVAL, JSON,
     JSONB, NAME, NUMERIC, OID, TEXT, TIME, TIMESTAMP, TIMESTAMPTZ, UUID, VARCHAR, ARRAY_OF,
+    Interval, make_interval,
 )
 
 _EPOCH = _dt.datetime(2000, 1, 1)
@@ -53,11 +54,9 @@ def _dec_numeric(b: bytes) -> Decimal:
     return Decimal((1 if sign == 0x4000 else 0, tuple(int(c) for c in text), -dscale))
 
 
-def _dec_interval(b: bytes) -> _dt.timedelta:
+def _dec_interval(b: bytes) -> Any:
     usec, days, months = struct.unpack("!qii", b)
-    years = int(months / 12)  # truncate toward zero, as PostgreSQL prints years and months
-    rest = months - years * 12
-    return _dt.timedelta(days=years * 365 + rest * 30 + days, microseconds=usec)
+    return make_interval(months, _dt.timedelta(days=days, microseconds=usec))
 
 
 def _dec_timestamp_bin(b: bytes) -> _dt.datetime:
@@ -199,6 +198,9 @@ def encode_scalar(value: Any, oid: int) -> bytes | None:
     if oid == TIME and isinstance(value, _dt.time) and value.tzinfo is None:
         t = _dt.timedelta(hours=value.hour, minutes=value.minute, seconds=value.second, microseconds=value.microsecond)
         return _s_i64.pack(_usec(t))
+    if oid == INTERVAL and isinstance(value, Interval):
+        d = value.delta
+        return struct.pack("!qii", (d.seconds * 1_000_000) + d.microseconds, d.days, value.months)
     if oid == INTERVAL and isinstance(value, _dt.timedelta):
         return struct.pack("!qii", _usec(value), 0, 0)
     if oid in ARRAY_OF.values() and isinstance(value, list):  # a one-dimensional array of scalars

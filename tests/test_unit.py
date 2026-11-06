@@ -148,7 +148,7 @@ def test_dump_scalars():
     assert _types.dump(None) == (0, None)
     assert _types.dump(True) == (16, b"t")
     assert _types.dump("x") == (0, b"x")
-    assert _types.dump(5) == (21, b"5")
+    assert _types.dump(5) == (23, b"5")  # int4: int2 would overflow in $1 * $2
     assert _types.dump(40000) == (23, b"40000")
     assert _types.dump(2**40) == (20, str(2**40).encode())
     assert _types.dump(2**70)[0] == 1700
@@ -174,11 +174,11 @@ def test_dump_rejects_bad_values():
 
 def test_dump_arrays():
     assert _types.dump(["a", "b"]) == (0, b'{"a","b"}')
-    assert _types.dump([1, 2]) == (1005, b"{1,2}")
+    assert _types.dump([1, 2]) == (1007, b"{1,2}")
     assert _types.dump([1, 70000])[0] == 1007
     assert _types.dump([]) == (0, b"{}")
     assert _types.dump(['a"b\\c', None]) == (0, b'{"a\\"b\\\\c",NULL}')
-    assert _types.dump([[1, 2], [3, 4]]) == (1005, b"{{1,2},{3,4}}")
+    assert _types.dump([[1, 2], [3, 4]]) == (1007, b"{{1,2},{3,4}}")
     assert _types.dump([True, False]) == (1000, b"{t,f}")
     assert _types.dump([Jsonb({"k": "v"})])[0] == 3807
     with pytest.raises(errors.ProgrammingError):
@@ -210,7 +210,8 @@ def test_decode_dates_and_times():
     assert aware.utcoffset() == -timedelta(hours=5, minutes=30)
     assert dec(1083, "14:06:05") == time(14, 6, 5)
     assert dec(1266, "14:06:05+02").utcoffset() == timedelta(hours=2)
-    assert dec(1186, "1 year 2 mons 3 days 04:05:06.5") == timedelta(days=365 + 60 + 3, hours=4, minutes=5, seconds=6.5)
+    assert dec(1186, "1 year 2 mons 3 days 04:05:06.5") == _types.Interval(
+        14, timedelta(days=3, hours=4, minutes=5, seconds=6.5))
     assert dec(1186, "-1 days +02:03:04") == timedelta(days=-1, hours=2, minutes=3, seconds=4)
     assert dec(1186, "00:00:01") == timedelta(seconds=1)
 

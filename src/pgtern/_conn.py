@@ -6,6 +6,7 @@ import collections
 import enum
 import itertools
 import logging
+import os
 import re
 import select
 import socket
@@ -19,7 +20,7 @@ from . import _binary
 from . import _protocol as P
 from . import _query, _types, errors, hooks
 from ._cursor import Cursor, ServerCursor
-from ._dsn import ConnParams, build_params
+from ._dsn import ConnParams, build_params, resolve_password
 from ._auth import Authenticator
 from .rows import tuple_row
 from .sql import Composable, quote_ident
@@ -103,8 +104,20 @@ def _ssl_context(params: ConnParams, mode: str) -> ssl.SSLContext:
         ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if params.sslcert:
-        ctx.load_cert_chain(params.sslcert, params.sslkey)
+        ctx.load_cert_chain(params.sslcert, params.sslkey, params.sslpassword)
+    if params.sslcrl and mode in ("verify-ca", "verify-full"):
+        ctx.load_verify_locations(cafile=params.sslcrl)
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
     return ctx
+
+
+def _tune_keepalive(sock: socket.socket) -> None:
+    """Notice a half-open TCP peer (failover, NAT timeout, host crash) in about a minute, not two hours."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
 
 def _send_cancel(host: str, port: int, pid: int, secret: int, tls_mode: str | None,
@@ -185,6 +198,8 @@ class Connection:
     def __init__(self, params: ConnParams, *, autocommit: bool = False,
                  row_factory: Callable | None = None) -> None:
         self._params = params
+        self._pid = os.getpid()  # a forked child must never talk on this socket
+        self._session_requirement = "any"
         self._autocommit = autocommit
         self.row_factory = row_factory or tuple_row
         self._default_row_factory = self.row_factory
@@ -221,17 +236,22 @@ class Connection:
     def _open(self) -> None:
         modes = ["disable", "require"] if self._params.sslmode == "allow" else [self._params.sslmode]
         last: errors.Error | None = None
-        for host, port in self._params.hosts:
-            for mode in modes:
-                try:
-                    self._connect_host(host, port, mode)
-                    return
-                except errors.Error as exc:
-                    last = exc
-                except OSError as exc:  # socket timeouts and TLS handshake failures
-                    last = errors.OperationalError(f'connection to server at "{host}", port {port} failed: {exc}')
-                    last.__cause__ = exc
-                self._drop_socket()
+        wanted = self._params.target_session_attrs
+        # prefer-standby looks for a standby first, then accepts any server
+        for requirement in (["standby", "any"] if wanted == "prefer-standby" else [wanted]):
+            self._session_requirement = requirement
+            for index, (host, port) in enumerate(self._params.hosts):
+                addr = self._params.hostaddrs[index] if index < len(self._params.hostaddrs) else None
+                for mode in modes:
+                    try:
+                        self._connect_host(host, port, mode, addr)
+                        return
+                    except errors.Error as exc:  # any startup failure moves on to the next host
+                        last = exc
+                    except OSError as exc:  # socket timeouts and TLS handshake failures
+                        last = errors.OperationalError(f'connection to server at "{host}", port {port} failed: {exc}')
+                        last.__cause__ = exc
+                    self._drop_socket()
         assert last is not None
         raise last
 
@@ -246,7 +266,7 @@ class Connection:
             except OSError:
                 pass
 
-    def _connect_host(self, host: str, port: int, mode: str) -> None:
+    def _connect_host(self, host: str, port: int, mode: str, addr: str | None = None) -> None:
         p = self._params
         unix = host.startswith("/")
         try:
@@ -255,9 +275,9 @@ class Connection:
                 sock.settimeout(p.connect_timeout)
                 sock.connect(f"{host}/.s.PGSQL.{port}")
             else:
-                sock = socket.create_connection((host, port), timeout=p.connect_timeout)
+                sock = socket.create_connection((addr or host, port), timeout=p.connect_timeout)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                _tune_keepalive(sock)
         except OSError as exc:
             raise errors.OperationalError(
                 f'connection to server at "{host}", port {port} failed: {exc}') from exc
@@ -274,7 +294,7 @@ class Connection:
             except (ssl.SSLError, ConnectionError) as exc:
                 self._drop_socket()
                 if mode == "prefer":
-                    return self._connect_host(host, port, "disable")
+                    return self._connect_host(host, port, "disable", addr)
                 raise errors.OperationalError(
                     f'SSL connection to server at "{host}", port {port} failed: {exc}') from exc
         self._tls_mode = mode if isinstance(self._sock, ssl.SSLSocket) else None
@@ -282,6 +302,7 @@ class Connection:
             self._startup()
         except socket.timeout as exc:  # pragma: no cover - mapped in _recv
             raise errors.OperationalError(f"timeout during connection startup: {exc}") from exc
+        self._check_session_attrs()
         if self._sock is not None:
             self._sock.settimeout(None)
         self._dates_ok = self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
@@ -297,6 +318,16 @@ class Connection:
             return sock
         raise errors.OperationalError(f"received an invalid response to the SSL request: {answer!r}")
 
+    def _check_session_attrs(self) -> None:
+        want = self._session_requirement
+        if want == "any":
+            return
+        row = self._simple("SELECT current_setting('transaction_read_only') = 'on', pg_is_in_recovery()")[-1].rows[0]
+        read_only, standby = row[0] == b"t", row[1] == b"t"
+        ok = {"read-write": not read_only, "read-only": read_only, "primary": not standby, "standby": standby}[want]
+        if not ok:
+            raise errors.OperationalError(f'server at "{self._host}", port {self._port} is not {want}')
+
     def _startup(self) -> None:
         p = self._params
         startup = {"user": p.user, "database": p.dbname, "client_encoding": "UTF8", "DateStyle": "ISO"}
@@ -306,7 +337,8 @@ class Connection:
             startup["options"] = p.options
         self._send(P.startup_message(startup))
         encrypted = self._tls_mode is not None or self._host.startswith("/")
-        auth = Authenticator(p.user, p.password, encrypted=encrypted, allow_plaintext=p.sslmode == "disable",
+        auth = Authenticator(p.user, resolve_password(p, self._host, self._port), encrypted=encrypted,
+                             allow_plaintext=p.sslmode == "disable",
                              require_scram=p.require_auth == "scram-sha-256")
         while True:
             tag, payload = self._next_message()
@@ -343,6 +375,9 @@ class Connection:
         sock = self._sock
         if sock is None:
             raise errors.OperationalError("the connection is closed")
+        if os.getpid() != self._pid:
+            raise errors.OperationalError(
+                "this connection was opened in another process (the program forked); open a new connection")
         try:
             sock.sendall(data)
         except (OSError, ssl.SSLError) as exc:
@@ -492,6 +527,9 @@ class Connection:
     def _check_open(self) -> None:
         if self._closed:
             raise errors.OperationalError("the connection is closed")
+        if os.getpid() != self._pid:
+            raise errors.OperationalError(
+                "this connection was opened in another process (the program forked); open a new connection")
 
     def _check_alive(self) -> bool:
         """Cheap liveness check for an idle connection: no round trip, just a non-blocking read."""
@@ -553,6 +591,8 @@ class Connection:
 
         window = 64
         pg_sql, redacted = self._query_text(sql)
+        if P.COPY_START.match(pg_sql):
+            raise errors.ProgrammingError("COPY can't be used with executemany; use cursor.copy() instead")
         with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -596,13 +636,17 @@ class Connection:
                 return error
 
             try:
+                pending = 0  # bytes sent since the replies were last read
                 for params in params_seq:
                     body = _encode(pg_sql, params)  # no Sync: the batch ends with one
                     in_flight.append(enter_hooks())
                     self._send(body)
-                    if len(in_flight) > window:
+                    pending += len(body)
+                    if len(in_flight) > window or pending > P.FLUSH_BYTES:
                         self._send(P.FLUSH)  # make the server send the replies it has produced so far
-                        while len(in_flight) > window // 2:
+                        target = window // 2 if len(in_flight) > window else 0
+                        pending = 0
+                        while len(in_flight) > target:
                             failure = read_one()
                             if failure is not None:
                                 break  # statements sent after a failure are skipped by the server
@@ -676,6 +720,7 @@ class Connection:
         """Send a COPY statement and wait for its Copy*Response; returns ``"in"`` or ``"out"``."""
         sql, redacted = self._query_text(query)
         self._check_open()
+        self._check_no_pipeline()  # a COPY in a pipeline waits for data the batch never sends
         if hooks._HOOKS:
             info = hooks.QueryInfo(redacted, self._host, self._port, self._params.dbname, self._params.user)
             for hook in tuple(hooks._HOOKS):
@@ -912,6 +957,9 @@ class Connection:
             self._closed = True
             self._tx_status = _BROKEN
             self._sock = None
+        if sock is not None and os.getpid() != self._pid:
+            sock.close()  # a forked child must not send Terminate over a socket its parent still uses
+            return
         if sock is not None:
             try:
                 sock.sendall(P.TERMINATE)
@@ -941,6 +989,6 @@ class Connection:
     def __del__(self) -> None:
         try:
             if not self._closed and self._sock is not None:
-                self._sock.close()
+                self._sock.close()  # no Terminate from a finalizer: a graceful close is close()'s job
         except Exception:
             pass

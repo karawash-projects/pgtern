@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import itertools
 import logging
+import os
+import socket
 import time
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Iterable, Sequence
@@ -28,7 +31,7 @@ from ._conn import (
 )
 from ._copy import format_row, parse_rows
 from ._cursor import Cursor
-from ._dsn import ConnParams, build_params
+from ._dsn import ConnParams, build_params, resolve_password
 from ._auth import Authenticator
 from .pipeline import _enter_hooks, _encode, _exit_hooks, _Item
 from .pool import PoolClosed, PoolTimeout
@@ -44,6 +47,15 @@ __all__ = ["connect", "AsyncConnection", "AsyncCursor", "AsyncServerCursor", "As
 def _buffered(reader: asyncio.StreamReader) -> int:
     """Bytes the stream has read from the socket but not handed out yet."""
     return len(getattr(reader, "_buffer", b""))  # asyncio keeps them in a private buffer; there is no public accessor
+
+
+def _tune_keepalive(sock: socket.socket) -> None:
+    """Notice a half-open TCP peer (failover, NAT timeout, host crash) in about a minute, not two hours."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
 
 async def _send_cancel_async(host: str, port: int, pid: int, secret: int, tls_mode: str | None,
@@ -364,6 +376,8 @@ class AsyncConnection:
     def __init__(self, params: ConnParams, *, autocommit: bool = False,
                  row_factory: Callable | None = None) -> None:
         self._params = params
+        self._pid = os.getpid()  # a forked child must never talk on this socket
+        self._session_requirement = "any"
         self._autocommit = autocommit
         self.row_factory = row_factory or tuple_row
         self._default_row_factory = self.row_factory
@@ -401,18 +415,24 @@ class AsyncConnection:
     async def _open(self) -> None:
         modes = ["disable", "require"] if self._params.sslmode == "allow" else [self._params.sslmode]
         last: errors.Error | None = None
-        for host, port in self._params.hosts:
-            for mode in modes:
-                try:
-                    await asyncio.wait_for(self._connect_host(host, port, mode), self._params.connect_timeout)
-                    return
-                except errors.Error as exc:
-                    last = exc
-                except (OSError, asyncio.TimeoutError) as exc:
-                    last = errors.OperationalError(
-                        f'connection to server at "{host}", port {port} failed: {exc or "timeout expired"}')
-                    last.__cause__ = exc
-                self._drop()
+        wanted = self._params.target_session_attrs
+        # prefer-standby looks for a standby first, then accepts any server
+        for requirement in (["standby", "any"] if wanted == "prefer-standby" else [wanted]):
+            self._session_requirement = requirement
+            for index, (host, port) in enumerate(self._params.hosts):
+                addr = self._params.hostaddrs[index] if index < len(self._params.hostaddrs) else None
+                for mode in modes:
+                    try:
+                        await asyncio.wait_for(self._connect_host(host, port, mode, addr),
+                                               self._params.connect_timeout)
+                        return
+                    except errors.Error as exc:  # any startup failure moves on to the next host
+                        last = exc
+                    except (OSError, asyncio.TimeoutError) as exc:
+                        last = errors.OperationalError(
+                            f'connection to server at "{host}", port {port} failed: {exc or "timeout expired"}')
+                        last.__cause__ = exc
+                    self._drop()
         assert last is not None
         raise last
 
@@ -424,18 +444,18 @@ class AsyncConnection:
         if writer is not None:
             writer.close()
 
-    async def _connect_host(self, host: str, port: int, mode: str) -> None:
+    async def _connect_host(self, host: str, port: int, mode: str, addr: str | None = None) -> None:
         unix = host.startswith("/")
         try:
             if unix:
                 reader, writer = await asyncio.open_unix_connection(f"{host}/.s.PGSQL.{port}")
             else:
-                reader, writer = await asyncio.open_connection(host, port)
+                reader, writer = await asyncio.open_connection(addr or host, port)
                 sock = writer.get_extra_info("socket")
                 if sock is not None:
+                    _tune_keepalive(sock)
                     import socket as _s
                     sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
-                    sock.setsockopt(_s.SOL_SOCKET, _s.SO_KEEPALIVE, 1)
         except OSError as exc:
             raise errors.OperationalError(f'connection to server at "{host}", port {port} failed: {exc}') from exc
         self._reader, self._writer = reader, writer
@@ -465,11 +485,23 @@ class AsyncConnection:
             except (OSError, asyncio.IncompleteReadError) as exc:
                 self._drop()
                 if mode == "prefer":
-                    return await self._connect_host(host, port, "disable")
+                    return await self._connect_host(host, port, "disable", addr)
                 raise errors.OperationalError(
                     f'SSL connection to server at "{host}", port {port} failed: {exc}') from exc
         await self._startup()
+        await self._check_session_attrs()
         self._dates_ok = self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
+
+    async def _check_session_attrs(self) -> None:
+        want = self._session_requirement
+        if want == "any":
+            return
+        row = (await self._simple("SELECT current_setting('transaction_read_only') = 'on', "
+                                  "pg_is_in_recovery()"))[-1].rows[0]
+        read_only, standby = row[0] == b"t", row[1] == b"t"
+        ok = {"read-write": not read_only, "read-only": read_only, "primary": not standby, "standby": standby}[want]
+        if not ok:
+            raise errors.OperationalError(f'server at "{self._host}", port {self._port} is not {want}')
 
     async def _startup(self) -> None:
         p = self._params
@@ -480,7 +512,8 @@ class AsyncConnection:
             startup["options"] = p.options
         await self._send(P.startup_message(startup))
         encrypted = self._tls_mode is not None or self._host.startswith("/")
-        auth = Authenticator(p.user, p.password, encrypted=encrypted, allow_plaintext=p.sslmode == "disable",
+        auth = Authenticator(p.user, resolve_password(p, self._host, self._port), encrypted=encrypted,
+                             allow_plaintext=p.sslmode == "disable",
                              require_scram=p.require_auth == "scram-sha-256")
         while True:
             tag, payload = await self._next_message()
@@ -511,6 +544,9 @@ class AsyncConnection:
         writer = self._writer
         if writer is None:
             raise errors.OperationalError("the connection is closed")
+        if os.getpid() != self._pid:
+            raise errors.OperationalError(
+                "this connection was opened in another process (the program forked); open a new connection")
         try:
             writer.write(data)
             await writer.drain()
@@ -668,6 +704,9 @@ class AsyncConnection:
     def _check_open(self) -> None:
         if self._closed:
             raise errors.OperationalError("the connection is closed")
+        if os.getpid() != self._pid:
+            raise errors.OperationalError(
+                "this connection was opened in another process (the program forked); open a new connection")
 
     def _check_alive(self) -> bool:
         reader, writer = self._reader, self._writer
@@ -722,6 +761,7 @@ class AsyncConnection:
     async def _start_copy(self, query: Any, params: Any, stack: AsyncExitStack) -> str:
         sql, redacted = self._query_text(query)
         self._check_open()
+        self._check_no_pipeline()  # a COPY in a pipeline waits for data the batch never sends
         if hooks._HOOKS:
             info = hooks.QueryInfo(redacted, self._host, self._port, self._params.dbname, self._params.user)
             for hook in tuple(hooks._HOOKS):
@@ -862,6 +902,8 @@ class AsyncConnection:
 
         window = 64
         pg_sql, redacted = self._query_text(sql)
+        if P.COPY_START.match(pg_sql):
+            raise errors.ProgrammingError("COPY can't be used with executemany; use cursor.copy() instead")
         async with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -904,17 +946,22 @@ class AsyncConnection:
 
             try:
                 pending: list[bytes] = []  # encoded statements not yet handed to the socket
+                unread = 0  # bytes sent since the replies were last read
                 for params in params_seq:
-                    pending.append(_encode(pg_sql, params))  # no Sync: the batch ends with one
+                    body = _encode(pg_sql, params)  # no Sync: the batch ends with one
+                    pending.append(body)
+                    unread += len(body)
                     in_flight.append(enter_hooks())
-                    if len(pending) >= window:  # coalesce: one socket write per window, not per statement
+                    if len(pending) >= window and unread <= P.FLUSH_BYTES:  # coalesce: one write per window
                         self._write(b"".join(pending))
                         pending.clear()
-                    if len(in_flight) > window:
+                    if len(in_flight) > window or unread > P.FLUSH_BYTES:
                         self._write(b"".join(pending) + P.FLUSH)  # Flush: the server sends replies so far
                         pending.clear()
                         await self._drain()
-                        while len(in_flight) > window // 2:
+                        target = window // 2 if len(in_flight) > window else 0
+                        unread = 0
+                        while len(in_flight) > target:
                             failure = await read_one()
                             if failure is not None:
                                 break  # statements sent after a failure are skipped by the server
@@ -1060,6 +1107,9 @@ class AsyncConnection:
     async def close(self) -> None:
         if self._closed:
             return
+        if os.getpid() != self._pid:
+            self._drop()  # a forked child must not send Terminate over a socket its parent still uses
+            return
         writer = self._writer
         self._closed = True
         self._tx_status = _BROKEN
@@ -1106,6 +1156,7 @@ class AsyncPipeline:
         self._batch_size = batch_size
         self._queue: list[_Item] = []
         self._begin_queued = False
+        self._queued_bytes = 0
         self._open = False
 
     async def __aenter__(self) -> "AsyncPipeline":
@@ -1121,10 +1172,14 @@ class AsyncPipeline:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
             if exc_type is None:
-                await self.sync()
+                if self._queue:  # nothing queued: nothing to synchronize, and the connection may be gone
+                    await self.sync()
             elif not self._conn.closed:
                 try:
-                    await self.sync()
+                    if self._conn._autocommit:
+                        await self._abort()  # the block failed: roll the batch back instead of committing it
+                    else:
+                        await self.sync()
                 except Exception:  # noqa: BLE001 - the body's exception is the one to report
                     pass
         finally:
@@ -1134,52 +1189,41 @@ class AsyncPipeline:
 
     async def execute(self, query: Any, params: Any = None) -> AsyncCursor:
         conn = self._conn
-        if self._open and len(self._queue) >= self._batch_size:
+        if self._open and (len(self._queue) >= self._batch_size or self._queued_bytes >= P.FLUSH_BYTES):
             await self.sync()  # before taking the lock: sync() takes it itself
         async with conn._lock:
             conn._check_open()
             if not self._open:
                 raise errors.ProgrammingError("the pipeline is not active (use it in an 'async with' block)")
             sql, redacted = conn._query_text(query)
-            if not conn._autocommit and conn._tx_status == _IDLE and not self._begin_queued:
+            if P.COPY_START.match(sql):
+                raise errors.ProgrammingError("COPY can't be used in a pipeline; use cursor.copy() outside it")
+            if conn._tx_status == _IDLE and not self._begin_queued:
+                # every batch runs in one transaction: with autocommit, sync() adds the COMMIT
                 await conn._send(P.extended_query("BEGIN", [], [], sync=False))
                 self._queue.append(_Item(None, "BEGIN", "BEGIN", hidden=True))
                 self._begin_queued = True
             cursor = AsyncCursor(conn)
             cursor._pipeline_pending = True
-            await conn._send(_encode(sql, params))
+            body = _encode(sql, params)
+            await conn._send(body)
+            self._queued_bytes += len(body)
             self._queue.append(_Item(cursor, sql, redacted))
             return cursor
 
-    async def sync(self) -> None:
+    async def _abort(self) -> None:
+        """Discard the queued batch: roll back what was sent and leave the connection idle."""
         conn = self._conn
         async with conn._lock:
-            conn._check_open()
             items, self._queue = self._queue, []
-            self._begin_queued = False
-            await conn._send(P.SYNC)
-            failure: errors.Error | None = None
-            # Items are shared with the sync pipeline (typed Cursor); here the cursor is always an AsyncCursor.
-            collected: list[tuple[Any, list]] = []
+            begun, self._begin_queued = self._begin_queued, False
+            self._queued_bytes = 0
             for item in items:
-                if failure is not None:
-                    if item.cursor is not None:
-                        item.cursor._pipeline_pending = False
-                        item.cursor._pipeline_error = errors.PipelineAborted(
-                            "not executed: an earlier statement in the pipeline failed")
-                    continue
-                info, entered = _enter_hooks(conn, item)
-                results, error = await self._read_reply(conn)
-                if info is not None and results is not None:
-                    info.rowcount = results[-1].rowcount if results else -1
-                _exit_hooks(entered, error)
-                if error is not None:
-                    failure = error
-                    if item.cursor is not None:
-                        item.cursor._pipeline_pending = False
-                        item.cursor._pipeline_error = error
-                elif item.cursor is not None and results is not None:
-                    collected.append((item.cursor, results))
+                if item.cursor is not None:
+                    item.cursor._pipeline_pending = False
+                    item.cursor._pipeline_error = errors.PipelineAborted(
+                        "the pipeline block raised, so this statement was rolled back")
+            await conn._send(P.SYNC)
             while True:
                 tag, payload = await conn._next_message()
                 if tag == 0x5A:
@@ -1192,12 +1236,75 @@ class AsyncPipeline:
                         raise errors.error_from_fields(fields)
                 else:
                     conn._handle_async_message(tag, payload)
-            await conn._prime_oids(c.type_code for _, res in collected for r in res if r.columns for c in r.columns)
-            for cursor, res in collected:
-                cursor._pipeline_pending = False
-                cursor._set_results(res)
-            if failure is not None:
-                raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
+            if begun and conn._tx_status != _IDLE:
+                # after a failed statement the server skips every message up to Sync, so the ROLLBACK
+                # has to be a round trip of its own
+                await conn._simple("ROLLBACK")
+
+    async def sync(self) -> None:
+        conn = self._conn
+        async with conn._lock:
+            conn._check_open()
+            items, self._queue = self._queue, []
+            begun, self._begin_queued = self._begin_queued, False
+            self._queued_bytes = 0
+            pending = [item.cursor for item in items if item.cursor is not None]
+            try:
+                if begun and conn._autocommit:
+                    # autocommit: the batch is one transaction, and this sync point is its commit point
+                    await conn._send(P.extended_query("COMMIT", [], [], sync=False))
+                    items.append(_Item(None, "COMMIT", "COMMIT", hidden=True))
+                await conn._send(P.SYNC)
+                failure: errors.Error | None = None
+                # Items are shared with the sync pipeline (typed Cursor); here the cursor is always an AsyncCursor.
+                collected: list[tuple[Any, list]] = []
+                for item in items:
+                    if failure is not None:
+                        if item.cursor is not None:
+                            item.cursor._pipeline_pending = False
+                            item.cursor._pipeline_error = errors.PipelineAborted(
+                                "not executed: an earlier statement in the pipeline failed")
+                        continue
+                    info, entered = _enter_hooks(conn, item)
+                    results, error = await self._read_reply(conn)
+                    if info is not None and results is not None:
+                        info.rowcount = results[-1].rowcount if results else -1
+                    _exit_hooks(entered, error)
+                    if error is not None:
+                        failure = error
+                        if item.cursor is not None:
+                            item.cursor._pipeline_pending = False
+                            item.cursor._pipeline_error = error
+                    elif item.cursor is not None and results is not None:
+                        collected.append((item.cursor, results))
+                while True:
+                    tag, payload = await conn._next_message()
+                    if tag == 0x5A:
+                        conn._tx_status = chr(payload[0])
+                        break
+                    if tag == 0x45:
+                        fields = P.parse_error_fields(payload)
+                        if fields.get("V", fields.get("S")) in ("FATAL", "PANIC"):
+                            conn._mark_broken()
+                            raise errors.error_from_fields(fields)
+                    else:
+                        conn._handle_async_message(tag, payload)
+                if begun and conn._autocommit and conn._tx_status != _IDLE:
+                    await conn._simple("ROLLBACK")  # the batch failed inside its transaction: leave it idle
+                await conn._prime_oids(c.type_code for _, res in collected for r in res if r.columns for c in r.columns)
+                for cursor, res in collected:
+                    cursor._pipeline_pending = False
+                    cursor._set_results(res)
+                if failure is not None:
+                    raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
+            except BaseException as exc:
+                # a dropped connection or a stopped server: every cursor still waiting gets the real error
+                for cursor in pending:
+                    if cursor._pipeline_pending:
+                        cursor._pipeline_pending = False
+                        cursor._pipeline_error = exc if isinstance(exc, errors.Error) else errors.OperationalError(
+                            f"the connection failed during the pipeline: {exc}")
+                raise
 
     @staticmethod
     async def _read_reply(conn: AsyncConnection) -> tuple[list | None, errors.Error | None]:
@@ -1227,25 +1334,27 @@ async def connect(conninfo: str = "", **kwargs: Any) -> AsyncConnection:
 class AsyncConnectionPool:
     """asyncio connection pool: ``min_size`` kept warm, up to ``max_size`` on demand.
 
-    Connections are liveness-checked on checkout, replaced when dead or older than
-    ``max_lifetime``, and rolled back when returned mid-transaction.
+    A background task keeps ``min_size`` connections open (replacing dead ones), retires connections
+    idle longer than ``max_idle`` while above ``min_size``, and retires connections older than
+    ``max_lifetime``. Connections are liveness-checked on checkout and rolled back when returned mid-transaction.
     """
 
     def __init__(self, conninfo: str = "", *, kwargs: dict[str, Any] | None = None, min_size: int = 4,
                  max_size: int | None = None, timeout: float = 30.0, max_lifetime: float = 3600.0,
-                 check: Callable | None = None, name: str | None = None) -> None:
+                 max_idle: float = 600.0, check: Callable | None = None, name: str | None = None) -> None:
         max_size = min_size if max_size is None else max_size
         if min_size < 0 or max_size < 1 or max_size < min_size:
             raise ValueError(f"bad pool sizes: min_size={min_size}, max_size={max_size}")
         self.conninfo, self.kwargs = conninfo, dict(kwargs or {})
         self.min_size, self.max_size = min_size, max_size
-        self.timeout, self.max_lifetime = timeout, max_lifetime
+        self.timeout, self.max_lifetime, self.max_idle = timeout, max_lifetime, max_idle
         self.name = name or f"apool-{id(self):x}"
         self._check = check
         self._idle: collections.deque[AsyncConnection] = collections.deque()
         self._out: set[AsyncConnection] = set()  # checked out and not yet returned
         self._slots: asyncio.Semaphore | None = None
         self._closed = True
+        self._maintainer: asyncio.Task | None = None
         self._default_autocommit = bool(self.kwargs.get("autocommit", False))
 
     async def open(self, wait: bool = True) -> None:
@@ -1254,16 +1363,65 @@ class AsyncConnectionPool:
         self._closed = False
         self._slots = asyncio.Semaphore(self.max_size)
         if wait:
-            conns = [await self._new() for _ in range(self.min_size)]
-            self._idle.extend(conns)
+            created: list[AsyncConnection] = []
+            try:
+                for _ in range(self.min_size):
+                    created.append(await self._new())
+            except BaseException:
+                self._closed = True  # a failed open leaves no connection behind
+                self._slots = None
+                for conn in created:
+                    await conn.close()
+                raise
+            for conn in created:
+                self._mark_idle(conn)
+                self._idle.append(conn)
+        self._maintainer = asyncio.get_running_loop().create_task(self._maintain(), name=f"pgtern-{self.name}")
 
     async def _new(self) -> AsyncConnection:
         return await connect(self.conninfo, **self.kwargs)
+
+    @staticmethod
+    def _mark_idle(conn: AsyncConnection) -> None:
+        conn._pool_idle_since = time.monotonic()  # type: ignore[attr-defined]
+
+    async def _maintain(self) -> None:
+        backoff = 0.5
+        while not self._closed:
+            try:
+                await self._tend()
+                backoff = 0.5
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the server may be down: back off, keep trying
+                log.warning("pool %s: couldn't keep connections open: %s", self.name, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    async def _tend(self) -> None:
+        now = time.monotonic()
+        keep: collections.deque[AsyncConnection] = collections.deque()
+        retire: list[AsyncConnection] = []
+        for conn in self._idle:
+            idle_for = now - getattr(conn, "_pool_idle_since", now)
+            surplus = idle_for > self.max_idle and len(self._idle) + len(self._out) > self.min_size
+            dead = conn.closed or not conn._check_alive() or now - conn.created >= self.max_lifetime
+            (retire if dead or surplus else keep).append(conn)
+        self._idle = keep
+        for conn in retire:
+            await conn.close()
+        while not self._closed and len(self._idle) + len(self._out) < self.min_size:
+            conn = await asyncio.wait_for(self._new(), self.timeout)
+            self._mark_idle(conn)
+            self._idle.append(conn)
 
     async def getconn(self, timeout: float | None = None) -> AsyncConnection:
         if self._closed or self._slots is None:
             raise PoolClosed("the pool is closed")
         wait = self.timeout if timeout is None else timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait  # one budget for the whole call: waiting for a slot and connecting
         try:
             await asyncio.wait_for(self._slots.acquire(), wait)
         except asyncio.TimeoutError:
@@ -1276,9 +1434,15 @@ class AsyncConnectionPool:
                         self._out.add(conn)
                         return conn
                 await conn.close()
-            conn = await asyncio.wait_for(self._new(), wait)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise PoolTimeout(f"couldn't get a connection after {wait:.2f} sec")
+            conn = await asyncio.wait_for(self._new(), remaining)
             self._out.add(conn)
             return conn
+        except asyncio.TimeoutError:
+            self._slots.release()
+            raise PoolTimeout(f"couldn't get a connection after {wait:.2f} sec") from None
         except BaseException:
             self._slots.release()
             raise
@@ -1308,6 +1472,7 @@ class AsyncConnectionPool:
             if self._closed or conn.closed or time.monotonic() - conn.created >= self.max_lifetime:
                 await conn.close()
             else:
+                self._mark_idle(conn)
                 self._idle.append(conn)
         finally:
             self._slots.release()
@@ -1336,6 +1501,11 @@ class AsyncConnectionPool:
 
     async def close(self) -> None:
         self._closed = True
+        task, self._maintainer = self._maintainer, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         while self._idle:
             await self._idle.popleft().close()
 
@@ -1345,8 +1515,6 @@ class AsyncConnectionPool:
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
-
-
 def _current_exc() -> BaseException | None:
     import sys
     return sys.exc_info()[1]

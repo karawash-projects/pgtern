@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -52,6 +53,7 @@ class ConnectionPool:
         if min_size < 0 or max_size < 1 or max_size < min_size:
             raise ValueError(f"bad pool sizes: min_size={min_size}, max_size={max_size}")
         self.conninfo = conninfo
+        self._pid = os.getpid()
         self.kwargs = dict(kwargs or {})
         self.min_size, self.max_size = min_size, max_size
         self.timeout, self.max_lifetime, self.max_idle = timeout, max_lifetime, max_idle
@@ -69,6 +71,29 @@ class ConnectionPool:
         self._thread: threading.Thread | None = None
         self._wake = threading.Event()
         if open:
+            self.open()
+
+    # ---------------------------------------------------------------- fork safety
+    def _check_fork(self) -> None:
+        """Called before any use: after a fork this process owns none of the parent's connections or threads."""
+        if os.getpid() != self._pid:
+            self._after_fork()
+
+    def _after_fork(self) -> None:
+        # Forget the parent's connections without closing them: a Terminate sent from here would end the
+        # parent's sessions. Locks and threads are recreated, because a forked lock may already be held.
+        was_open = not self._closed
+        self._pid = os.getpid()
+        self._cond = threading.Condition()
+        self._idle = collections.deque()
+        self._out = set()
+        self._n = 0
+        self._connecting = 0
+        self._waiting = 0
+        self._wake = threading.Event()
+        self._thread = None
+        self._closed = True
+        if was_open:
             self.open()
 
     # ---------------------------------------------------------------- lifecycle
@@ -96,6 +121,7 @@ class ConnectionPool:
                 self._cond.wait(min(remaining, 0.2))
 
     def close(self, timeout: float = 5.0) -> None:
+        self._check_fork()
         with self._cond:
             if self._closed:
                 return
@@ -123,6 +149,7 @@ class ConnectionPool:
         self.close()
 
     def get_stats(self) -> dict[str, int]:
+        self._check_fork()
         with self._cond:
             return {
                 "pool_min": self.min_size, "pool_max": self.max_size,
@@ -215,6 +242,7 @@ class ConnectionPool:
 
     # ---------------------------------------------------------------- public API
     def getconn(self, timeout: float | None = None) -> Connection:
+        self._check_fork()
         timeout = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         backoff = 0.1
@@ -274,6 +302,7 @@ class ConnectionPool:
             return conn
 
     def putconn(self, conn: Connection) -> None:
+        self._check_fork()
         with self._cond:
             if conn not in self._out:
                 raise errors.ProgrammingError(

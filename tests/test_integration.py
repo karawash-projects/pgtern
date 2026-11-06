@@ -209,7 +209,7 @@ def test_server_types_decode(conn):
         "'{1,2}'::int4[], '{a,b}'::varchar[], ARRAY['{\"a\": 1}'::jsonb], '10.0.0.1'::inet"
     ).fetchone()
     assert row == (1, 2, 3, 1.25, "x", "ab  ", "n", {"k": [1, 2]}, {"k": 1},
-                   timedelta(days=365 + 60 + 3, hours=4, minutes=5, seconds=6), [1, 2], ["a", "b"],
+                   pgtern.Interval(14, timedelta(days=3, hours=4, minutes=5, seconds=6)), [1, 2], ["a", "b"],
                    [{"a": 1}], "10.0.0.1")  # inet has no decoder yet: it comes back as text
 
 

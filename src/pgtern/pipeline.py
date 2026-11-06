@@ -17,8 +17,11 @@ statements.
 * Errors: when one statement fails the server skips the rest of the batch. Those statements
   get :class:`pgtern.errors.PipelineAborted`. A sync point raises the first error of its batch,
   and the failing statement's cursor holds the same error. Inside a transaction you must roll back
-  afterwards, as with any failure.
+  afterwards, as with any failure. If the block exits with an exception under autocommit, the batch
+  is rolled back, not committed.
 * Only text format is used (``binary=True`` is not available in pipelines).
+* COPY cannot be used in a pipeline. Pipelines also read their replies before sending more than
+  ``P.FLUSH_BYTES`` bytes, so large parameters and large results cannot deadlock.
 """
 from __future__ import annotations
 
@@ -86,6 +89,7 @@ class Pipeline:
         self._batch_size = batch_size
         self._queue: list[_Item] = []
         self._begin_queued = False
+        self._queued_bytes = 0
         self._open = False
 
     # ---------------------------------------------------------------- block
@@ -102,10 +106,14 @@ class Pipeline:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
             if exc_type is None:
-                self.sync()
+                if self._queue:  # nothing queued: nothing to synchronize, and the connection may be gone
+                    self.sync()
             elif not self._conn.closed:
                 try:
-                    self.sync()  # read the replies so the connection stays usable
+                    if self._conn._autocommit:
+                        self._abort()  # the block failed: roll the batch back instead of committing it
+                    else:
+                        self.sync()  # read the replies so the connection stays usable
                 except Exception:  # noqa: BLE001 - the original exception is what matters
                     pass
         finally:
@@ -123,49 +131,37 @@ class Pipeline:
             if not self._open:
                 raise errors.ProgrammingError("the pipeline is not active (use it in a 'with' block)")
             sql, redacted = conn._query_text(query)
-            if len(self._queue) >= self._batch_size:
-                self.sync()
-            if not conn._autocommit and conn._tx_status == _IDLE and not self._begin_queued:
+            if P.COPY_START.match(sql):
+                raise errors.ProgrammingError("COPY can't be used in a pipeline; use cursor.copy() outside it")
+            if len(self._queue) >= self._batch_size or self._queued_bytes >= P.FLUSH_BYTES:
+                self.sync()  # read what was sent before sending more
+            if conn._tx_status == _IDLE and not self._begin_queued:
+                # every batch runs in one transaction: with autocommit, sync() adds the COMMIT
                 conn._send(P.extended_query("BEGIN", [], [], sync=False))
                 self._queue.append(_Item(None, "BEGIN", "BEGIN", hidden=True))
                 self._begin_queued = True
             cursor = Cursor(conn)
             cursor._pipeline_pending = True
-            conn._send(_encode(sql, params))
+            body = _encode(sql, params)
+            conn._send(body)
+            self._queued_bytes += len(body)
             self._queue.append(_Item(cursor, sql, redacted))
             return cursor
 
-    # ---------------------------------------------------------------- sync point
-    def sync(self) -> None:
-        """Send Sync, read every queued reply and fill in the cursors."""
+    def _abort(self) -> None:
+        """Discard the queued batch: roll back what was sent and leave the connection idle."""
         conn = self._conn
         with conn._lock:
-            conn._check_open()
             items, self._queue = self._queue, []
-            self._begin_queued = False
-            conn._send(P.SYNC)
-            failure: errors.Error | None = None
-            collected: list[tuple[Cursor, list]] = []
+            begun, self._begin_queued = self._begin_queued, False
+            self._queued_bytes = 0
             for item in items:
-                if failure is not None:
-                    if item.cursor is not None:
-                        item.cursor._pipeline_pending = False
-                        item.cursor._pipeline_error = errors.PipelineAborted(
-                            "not executed: an earlier statement in the pipeline failed")
-                    continue
-                info, entered = _enter_hooks(conn, item)
-                results, error = self._read_reply(conn)
-                if info is not None and results is not None:
-                    info.rowcount = results[-1].rowcount if results else -1
-                _exit_hooks(entered, error)
-                if error is not None:
-                    failure = error
-                    if item.cursor is not None:
-                        item.cursor._pipeline_pending = False
-                        item.cursor._pipeline_error = error
-                elif item.cursor is not None and results is not None:
-                    collected.append((item.cursor, results))
-            while True:  # the rest of a failed batch sends nothing but ReadyForQuery
+                if item.cursor is not None:
+                    item.cursor._pipeline_pending = False
+                    item.cursor._pipeline_error = errors.PipelineAborted(
+                        "the pipeline block raised, so this statement was rolled back")
+            conn._send(P.SYNC)
+            while True:
                 tag, payload = conn._next_message()
                 if tag == 0x5A:
                     conn._tx_status = chr(payload[0])
@@ -177,12 +173,76 @@ class Pipeline:
                         raise errors.error_from_fields(fields)
                 else:
                     conn._handle_async_message(tag, payload)
-            conn._prime_loaders([r for _, res in collected for r in res])
-            for cursor, res in collected:
-                cursor._pipeline_pending = False
-                cursor._set_results(res)
-            if failure is not None:
-                raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
+            if begun and conn._tx_status != _IDLE:
+                # after a failed statement the server skips every message up to Sync, so the ROLLBACK
+                # has to be a round trip of its own
+                conn._simple("ROLLBACK")
+
+    # ---------------------------------------------------------------- sync point
+    def sync(self) -> None:
+        """Send Sync, read every queued reply and fill in the cursors."""
+        conn = self._conn
+        with conn._lock:
+            conn._check_open()
+            items, self._queue = self._queue, []
+            begun, self._begin_queued = self._begin_queued, False
+            self._queued_bytes = 0
+            pending = [item.cursor for item in items if item.cursor is not None]
+            try:
+                if begun and conn._autocommit:
+                    # autocommit: the batch is one transaction, and this sync point is its commit point
+                    conn._send(P.extended_query("COMMIT", [], [], sync=False))
+                    items.append(_Item(None, "COMMIT", "COMMIT", hidden=True))
+                conn._send(P.SYNC)
+                failure: errors.Error | None = None
+                collected: list[tuple[Cursor, list]] = []
+                for item in items:
+                    if failure is not None:
+                        if item.cursor is not None:
+                            item.cursor._pipeline_pending = False
+                            item.cursor._pipeline_error = errors.PipelineAborted(
+                                "not executed: an earlier statement in the pipeline failed")
+                        continue
+                    info, entered = _enter_hooks(conn, item)
+                    results, error = self._read_reply(conn)
+                    if info is not None and results is not None:
+                        info.rowcount = results[-1].rowcount if results else -1
+                    _exit_hooks(entered, error)
+                    if error is not None:
+                        failure = error
+                        if item.cursor is not None:
+                            item.cursor._pipeline_pending = False
+                            item.cursor._pipeline_error = error
+                    elif item.cursor is not None and results is not None:
+                        collected.append((item.cursor, results))
+                while True:  # the rest of a failed batch sends nothing but ReadyForQuery
+                    tag, payload = conn._next_message()
+                    if tag == 0x5A:
+                        conn._tx_status = chr(payload[0])
+                        break
+                    if tag == 0x45:
+                        fields = P.parse_error_fields(payload)
+                        if fields.get("V", fields.get("S")) in ("FATAL", "PANIC"):
+                            conn._mark_broken()
+                            raise errors.error_from_fields(fields)
+                    else:
+                        conn._handle_async_message(tag, payload)
+                if begun and conn._autocommit and conn._tx_status != _IDLE:
+                    conn._simple("ROLLBACK")  # the batch failed inside its transaction: leave it idle
+                conn._prime_loaders([r for _, res in collected for r in res])
+                for cursor, res in collected:
+                    cursor._pipeline_pending = False
+                    cursor._set_results(res)
+                if failure is not None:
+                    raise failure  # the cursors hold it too; raising here means a failure cannot pass silently
+            except BaseException as exc:
+                # a dropped connection or a stopped server: every cursor still waiting gets the real error
+                for cursor in pending:
+                    if cursor._pipeline_pending:
+                        cursor._pipeline_pending = False
+                        cursor._pipeline_error = exc if isinstance(exc, errors.Error) else errors.OperationalError(
+                            f"the connection failed during the pipeline: {exc}")
+                raise
 
     @staticmethod
     def _read_reply(conn: Any) -> tuple[list | None, errors.Error | None]:

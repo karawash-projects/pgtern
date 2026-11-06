@@ -230,6 +230,6 @@ def test_randomized_server_generated_values_agree(dsn):
 
 
 def test_text_interval_with_mixed_signs_regression():
-    from pgtern._types import _dec_interval
+    from pgtern._types import Interval, _dec_interval
     got = _dec_interval("-11 mons +785 days 23:26:23.969766")
-    assert got == dt.timedelta(days=-330 + 785, hours=23, minutes=26, seconds=23, microseconds=969766)
+    assert got == Interval(-11, dt.timedelta(days=785, hours=23, minutes=26, seconds=23, microseconds=969766))

@@ -16,6 +16,7 @@ from . import adapters, aio, errors, hooks, rows, sql, types
 from ._conn import Connection, ConnectionInfo, Transaction, TransactionStatus
 from ._cursor import Cursor, ServerCursor
 from ._protocol import Notify
+from ._types import Interval
 from .errors import (
     DatabaseError, DataError, Error, IntegrityError, InterfaceError, InternalError,
     NotSupportedError, OperationalError, ProgrammingError, Warning,
@@ -38,7 +39,7 @@ def connect(conninfo: str = "", **kwargs: Any) -> Connection:
 
 
 __all__ = [
-    "connect", "Connection", "ConnectionInfo", "ConnectionPool", "Cursor", "ServerCursor", "Notify", "Transaction",
+    "connect", "Connection", "ConnectionInfo", "ConnectionPool", "Cursor", "ServerCursor", "Notify", "Interval", "Transaction",
     "TransactionStatus", "PoolClosed", "PoolTimeout", "QueryInfo", "add_query_hook",
     "Warning", "Error", "InterfaceError", "DatabaseError", "DataError", "OperationalError",
     "IntegrityError", "InternalError", "ProgrammingError", "NotSupportedError",

@@ -3,14 +3,15 @@
 
 Parameters are sent in text format. Strings go out with the "unknown" type OID
 (0) so the server infers the type from context (``%s::int``, ``col = %s``); ints
-are sent as int2/int4/int8/numeric by size, so ``f(smallint)`` calls
-still resolve. Results are decoded from text format; types without a decoder
+are sent as int4, int8 or numeric by size (never int2: ``$1 * $2`` on smallint parameters overflows).
+Use an explicit cast for a function that only takes smallint. Results are decoded from text format; types without a decoder
 come back as ``str``.
 """
 from __future__ import annotations
 
 import binascii
 import json
+from dataclasses import dataclass
 import re
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
@@ -58,9 +59,7 @@ def dump(value: Any) -> tuple[int, bytes | None]:
     if value is True or value is False:
         return BOOL, b"t" if value else b"f"
     if isinstance(value, int):
-        if -32768 <= value <= 32767:
-            oid = INT2
-        elif -2147483648 <= value <= 2147483647:
+        if -2147483648 <= value <= 2147483647:
             oid = INT4
         elif -9223372036854775808 <= value <= 9223372036854775807:
             oid = INT8
@@ -87,6 +86,10 @@ def dump(value: Any) -> tuple[int, bytes | None]:
         return DATE, value.isoformat().encode()
     if isinstance(value, time):
         return (TIMETZ if value.tzinfo is not None else TIME), value.isoformat().encode()
+    if isinstance(value, Interval):
+        d = value.delta
+        return INTERVAL, (f"{value.months} months {d.days} days {d.seconds} seconds "
+                          f"{d.microseconds} microseconds").encode()
     if isinstance(value, timedelta):
         return INTERVAL, f"{value.days} days {value.seconds} seconds {value.microseconds} microseconds".encode()
     if isinstance(value, uuid.UUID):
@@ -234,18 +237,34 @@ def _dec_timetz(s: str) -> time:
     return _make_time(s, True)
 
 
-def _dec_interval(s: str) -> timedelta:
-    """PostgreSQL ``postgres`` IntervalStyle. A year counts as 365 days and a month as 30."""
+@dataclass(frozen=True)
+class Interval:
+    """A PostgreSQL interval that has months or years in it.
+
+    Python's timedelta has no months, and a month is not a fixed number of days, so ``months`` is kept
+    apart from ``delta`` (the days and the time). Intervals without months come back as a timedelta.
+    """
+
+    months: int = 0
+    delta: timedelta = timedelta()
+
+
+def make_interval(months: int, delta: timedelta) -> timedelta | Interval:
+    return Interval(months, delta) if months else delta
+
+
+def _dec_interval(s: str) -> timedelta | Interval:
+    """PostgreSQL ``postgres`` IntervalStyle text."""
     m = _INTERVAL_RE.match(s.strip())
     if not m:
         raise errors.NotSupportedError(f"can't decode interval {s!r}: only IntervalStyle 'postgres' is supported")
     years, months, days = (int(m.group(i) or 0) for i in (1, 2, 3))
-    delta = timedelta(days=years * 365 + months * 30 + days)
+    delta = timedelta(days=days)
     if m.group(5) is not None:
         clock = timedelta(hours=int(m.group(5)), minutes=int(m.group(6)), seconds=int(m.group(7)),
                           microseconds=int((m.group(8) or "").ljust(6, "0")))
         delta += -clock if m.group(4) == "-" else clock
-    return delta
+    return make_interval(years * 12 + months, delta)
 
 
 _SCALAR_DECODERS: dict[int, Callable[[str], Any] | None] = {

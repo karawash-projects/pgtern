@@ -6,6 +6,7 @@ can later be driven by asyncio, Trio or a blocking socket.
 """
 from __future__ import annotations
 
+import re
 import struct
 from typing import NamedTuple, Sequence
 
@@ -68,6 +69,14 @@ def extended_query(sql: str, oids: Sequence[int], values: Sequence[bytes | None]
 
 
 SYNC = _msg(b"S", b"")
+
+# Bytes a pipeline or executemany may send before it must read the replies it is owed. Without this bound a
+# client and a server can each block on a full socket: the server writes big results, the client writes big
+# parameters, and neither reads.
+FLUSH_BYTES = 256 * 1024
+
+# COPY cannot run in a pipeline or executemany: the server waits for data the batch never sends.
+COPY_START = re.compile(r"\s*copy\b", re.IGNORECASE)
 # The server buffers its replies until a Sync or a Flush: pipelines use Flush to read mid-batch.
 FLUSH = _msg(b"H", b"")
 
