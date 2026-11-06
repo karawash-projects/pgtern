@@ -80,7 +80,8 @@ jobs:
           PGTERN_PORT: "54329"
         run: |
           scripts/start-test-postgres.sh > "$RUNNER_TEMP/testenv.sh"
-          sed 's/^export //' "$RUNNER_TEMP/testenv.sh" >> "$GITHUB_ENV"
+          # GITHUB_ENV takes the value literally, so the quotes around the DSN have to go
+          sed -e 's/^export //' -e 's/"//g' "$RUNNER_TEMP/testenv.sh" >> "$GITHUB_ENV"
           echo "PGTERN_TEST_RESTART_CMD=/usr/lib/postgresql/16/bin/pg_ctl -D $RUNNER_TEMP/pgroot/data -l $RUNNER_TEMP/pgroot/server.log -w restart -m fast" >> "$GITHUB_ENV"
       - name: Start pgbouncer in transaction mode
         run: |
