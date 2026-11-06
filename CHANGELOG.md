@@ -4,6 +4,19 @@ All notable changes to pgtern are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-06
+
+### Fixed
+
+- The notifications example in the README connects with `autocommit=True`, so `LISTEN` takes effect.
+- The package index now shows project links (homepage, source, issues and changelog).
+
+### Documentation
+
+- The README follows the usual project layout, with absolute links and a status note.
+- The security support table lists 0.4.x as supported.
+- The contributing guide has the real clone URL.
+
 ## [0.4.0] - 2026-11-06
 
 ### Changed (behaviour)
