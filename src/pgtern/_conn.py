@@ -21,7 +21,7 @@ from . import _protocol as P
 from . import _query, _types, errors, hooks
 from ._cursor import Cursor, ServerCursor
 from ._dsn import ConnParams, build_params, resolve_password
-from ._auth import Authenticator
+from ._auth import Authenticator, channel_binding_data
 from .rows import tuple_row
 from .sql import Composable, quote_ident
 
@@ -31,7 +31,8 @@ if TYPE_CHECKING:
 log = logging.getLogger("pgtern")
 
 _IDLE, _INTRANS, _INERROR, _BROKEN = "I", "T", "E", "?"
-PRIME_SQL = ('SELECT t.oid, n.nspname, t.typname, t.typelem, t.typcategory FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.oid IN ({ids}) OR t.oid IN (SELECT typelem FROM pg_type WHERE oid IN ({ids}) AND typelem <> 0)')
+PRIME_SQL = ('SELECT t.oid, n.nspname, t.typname, t.typelem, t.typcategory, t.typdelim FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.oid IN ({ids}) OR t.oid IN (SELECT typelem FROM pg_type WHERE oid IN ({ids}) AND typelem <> 0)')
+_DDL = re.compile(r"\s*(create|alter|drop)\b", re.IGNORECASE)  # statements that can change a type
 
 
 class TransactionStatus(enum.Enum):
@@ -160,6 +161,7 @@ class Transaction:
 
     def __enter__(self) -> "Transaction":
         conn = self._conn
+        conn._reentry_check()
         with conn._lock:
             conn._check_open()
             if conn._tx_status == _IDLE:
@@ -217,7 +219,11 @@ class Connection:
         self._savepoint_ids = itertools.count(1)
         self._host = ""
         self._port = 0
-        self._dates_ok = True
+        self._copy_depth = 0
+        self._handler_depth = 0
+        self._deadline: float | None = None  # connect_timeout budget while connecting
+        self._auth: Authenticator | None = None  # the last login's state (its SASL mechanism, for inspection)
+        self.max_result_bytes: int | None = None  # None: no cap; see the README
         self._notice_handlers: list[Callable[[errors.Diagnostic], None]] = []
         self._notify_handlers: list[Callable[[P.Notify], None]] = []
         self._loader_cache: dict[int, Any] = {}
@@ -232,6 +238,15 @@ class Connection:
         conn = cls(build_params(conninfo, **kwargs), autocommit=autocommit, row_factory=row_factory)
         conn._open()
         return conn
+
+    def _budget(self) -> float | None:
+        """What is left of the connect budget, for the next blocking step (None: no limit)."""
+        if self._deadline is None:
+            return None
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise errors.OperationalError(f"connection timed out after {self._params.connect_timeout:g} seconds")
+        return left
 
     def _open(self) -> None:
         modes = ["disable", "require"] if self._params.sslmode == "allow" else [self._params.sslmode]
@@ -267,15 +282,23 @@ class Connection:
                 pass
 
     def _connect_host(self, host: str, port: int, mode: str, addr: str | None = None) -> None:
-        p = self._params
+        """One attempt at one host: connect_timeout bounds it, from the socket to the end of startup."""
+        limit = self._params.connect_timeout
+        self._deadline = None if limit is None else time.monotonic() + limit
+        try:
+            self._connect_host_once(host, port, mode, addr)
+        finally:
+            self._deadline = None
+
+    def _connect_host_once(self, host: str, port: int, mode: str, addr: str | None = None) -> None:
         unix = host.startswith("/")
         try:
             if unix:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(p.connect_timeout)
+                sock.settimeout(self._budget())
                 sock.connect(f"{host}/.s.PGSQL.{port}")
             else:
-                sock = socket.create_connection((addr or host, port), timeout=p.connect_timeout)
+                sock = socket.create_connection((addr or host, port), timeout=self._budget())
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 _tune_keepalive(sock)
         except OSError as exc:
@@ -305,9 +328,23 @@ class Connection:
         self._check_session_attrs()
         if self._sock is not None:
             self._sock.settimeout(None)
-        self._dates_ok = self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
+
+    @property
+    def _dates_ok(self) -> bool:
+        """Live: SET DateStyle changes it, and the server reports every change."""
+        return self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
+
+    @property
+    def _codec(self) -> str:
+        return _types.text_codec(self._server_params.get("client_encoding", "UTF8"))
+
+    def _before_send(self, sql: str, params: Any) -> None:
+        P.check_encodable(self._codec, sql, params)
+        if _DDL.match(sql):  # a type may have changed under the same name: forget the cached loaders
+            self._loader_cache.clear()
 
     def _negotiate_tls(self, sock: socket.socket, host: str, mode: str) -> socket.socket:
+        sock.settimeout(self._budget())
         sock.sendall(P.SSL_REQUEST)
         answer = sock.recv(1)
         if answer == b"S":
@@ -337,9 +374,11 @@ class Connection:
             startup["options"] = p.options
         self._send(P.startup_message(startup))
         encrypted = self._tls_mode is not None or self._host.startswith("/")
+        binding = channel_binding_data(self._sock) if self._tls_mode is not None else None
         auth = Authenticator(p.user, resolve_password(p, self._host, self._port), encrypted=encrypted,
                              allow_plaintext=p.sslmode == "disable",
-                             require_scram=p.require_auth == "scram-sha-256")
+                             require_scram=p.require_auth == "scram-sha-256", channel_binding=binding)
+        self._auth = auth
         while True:
             tag, payload = self._next_message()
             if tag == 0x52:  # R Authentication*
@@ -389,6 +428,8 @@ class Connection:
             sock = self._sock
             if sock is None:
                 raise errors.OperationalError("the connection is closed")
+            if self._deadline is not None:  # during connect: never wait past the budget
+                sock.settimeout(self._budget())
             try:
                 data = sock.recv(65536)
             except (OSError, ssl.SSLError) as exc:
@@ -400,11 +441,30 @@ class Connection:
             self._pending.extend(self._parser.feed(data))
         return self._pending.popleft()
 
+    def _reentry_check(self) -> None:
+        """Refuse a query made from inside a COPY block or a notice/notify handler: the reply is still
+        being read there, so a second statement would break the protocol (sync) or deadlock (async)."""
+        if self._copy_depth or self._handler_depth:
+            raise errors.ProgrammingError(
+                "can't use the connection inside a COPY block or a notice/notify handler: "
+                "run the statement after the block, or outside the handler")
+
+    def _dispatch(self, handler: Callable, arg: Any) -> None:
+        """Run a user handler. Its exceptions are logged, never raised through the reply reader,
+        which would leave the rest of the reply unread."""
+        self._handler_depth += 1
+        try:
+            handler(arg)
+        except Exception:
+            log.exception("exception in a notice or notify handler")
+        finally:
+            self._handler_depth -= 1
+
     def _notice(self, payload: bytes) -> None:
         diag = errors.Diagnostic(P.parse_error_fields(payload))
         if self._notice_handlers:
             for handler in self._notice_handlers:
-                handler(diag)
+                self._dispatch(handler, diag)
         else:
             log.debug("server notice: %s", diag.message_primary)
 
@@ -419,7 +479,7 @@ class Connection:
         note = P.parse_notification(payload)
         if self._notify_handlers:
             for handler in self._notify_handlers:
-                handler(note)
+                self._dispatch(handler, note)
         else:
             self._notifies.append(note)
 
@@ -441,6 +501,7 @@ class Connection:
         """
         count = 0
         while stop_after is None or count < stop_after:
+            self._reentry_check()
             with self._lock:
                 self._check_open()
                 if not self._notifies:
@@ -489,7 +550,7 @@ class Connection:
 
     def _read_cycle(self) -> list[P.Result]:
         """Read messages up to and including ReadyForQuery; raise the server error, if any."""
-        collector = P.QueryCollector()
+        collector = P.QueryCollector(self.max_result_bytes)
         error: dict[str, str] | None = None
         unsupported = False
         while True:
@@ -522,6 +583,8 @@ class Connection:
             raise errors.NotSupportedError("COPY must be run with cursor.copy(), not execute()")
         if error is not None:
             raise errors.error_from_fields(error)
+        if collector.error is not None:
+            raise collector.error
         return collector.results
 
     def _check_open(self) -> None:
@@ -593,6 +656,7 @@ class Connection:
         pg_sql, redacted = self._query_text(sql)
         if P.COPY_START.match(pg_sql):
             raise errors.ProgrammingError("COPY can't be used with executemany; use cursor.copy() instead")
+        self._reentry_check()
         with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -614,7 +678,7 @@ class Connection:
                     info = hooks.QueryInfo(redacted, self._host, self._port, self._params.dbname, self._params.user)
                     for hook in tuple(hooks._HOOKS):
                         try:
-                            stack.enter_context(hook(info))
+                            stack.enter_context(hooks.guarded(hook(info)))
                         except Exception:
                             log.exception("a pgtern query hook failed on entry; ignoring it")
                 return stack, info
@@ -638,6 +702,7 @@ class Connection:
             try:
                 pending = 0  # bytes sent since the replies were last read
                 for params in params_seq:
+                    self._before_send(sql, params)
                     body = _encode(pg_sql, params)  # no Sync: the batch ends with one
                     in_flight.append(enter_hooks())
                     self._send(body)
@@ -702,6 +767,7 @@ class Connection:
             return total
 
     def _send_query(self, sql: str, params: Any, *, inline: bool = False) -> None:
+        self._before_send(sql, params)
         begin = not self._autocommit and self._tx_status == _IDLE
         if inline and params is not None:  # client-side binding: PostgreSQL has no parameters in COPY
             sql, params = _query.translate(sql, params, _types.render_literal)[0], None
@@ -725,7 +791,7 @@ class Connection:
             info = hooks.QueryInfo(redacted, self._host, self._port, self._params.dbname, self._params.user)
             for hook in tuple(hooks._HOOKS):
                 try:
-                    stack.enter_context(hook(info))
+                    stack.enter_context(hooks.guarded(hook(info)))
                 except Exception:
                     log.exception("a pgtern query hook failed on entry; ignoring it")
         self._send_query(sql, params, inline=True)
@@ -813,6 +879,7 @@ class Connection:
 
         Costs one extra round trip (describe) per statement, so it is opt-in with ``binary=True``.
         """
+        self._before_send(sql, params)
         begin = not self._autocommit and self._tx_status == _IDLE
         if begin:
             self._simple("BEGIN")
@@ -843,6 +910,7 @@ class Connection:
     def _execute(self, query: Any, params: Any, binary: bool = False) -> list[P.Result]:
         sql, redacted = self._query_text(query)
         run = self._run_binary if binary else self._run
+        self._reentry_check()
         with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -853,7 +921,7 @@ class Connection:
                 with ExitStack() as stack:
                     for hook in tuple(hooks._HOOKS):
                         try:
-                            stack.enter_context(hook(info))
+                            stack.enter_context(hooks.guarded(hook(info)))
                         except Exception:
                             log.exception("a pgtern query hook failed on entry; ignoring it")
                     results = run(sql, params)
@@ -871,6 +939,8 @@ class Connection:
 
     def execute(self, query: Any, params: Any = None, *, prepare: bool | None = None,
                 binary: bool | None = None) -> Cursor:
+        if prepare:
+            raise errors.NotSupportedError("prepare=True is not supported: pgtern runs statements unnamed")
         return self.cursor().execute(query, params, binary=bool(binary))
 
     @property
@@ -883,6 +953,7 @@ class Connection:
 
     @autocommit.setter
     def autocommit(self, value: bool) -> None:
+        self._reentry_check()
         with self._lock:
             if bool(value) != self._autocommit and self._tx_status not in (_IDLE, _BROKEN):
                 raise errors.ProgrammingError("can't change 'autocommit' now: connection in a transaction")
@@ -896,6 +967,7 @@ class Connection:
                 "the transaction was rolled back, not committed: a statement in it had failed")})
 
     def commit(self) -> None:
+        self._reentry_check()
         with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -907,6 +979,7 @@ class Connection:
                 self._commit_or_fail()
 
     def rollback(self) -> None:
+        self._reentry_check()
         with self._lock:
             self._check_open()
             self._check_no_pipeline()

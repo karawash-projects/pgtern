@@ -21,11 +21,11 @@ def format_row(row: Sequence[Any]) -> bytes:
     return ("\t".join(fields) + "\n").encode("utf-8")
 
 
-def _unescape(field: bytes) -> str | None:
+def _unescape(field: bytes, codec: str = "utf-8") -> str | None:
     if field == b"\\N":
         return None
     if b"\\" not in field:
-        return field.decode("utf-8")
+        return field.decode(codec)
     out = bytearray()
     i, n = 0, len(field)
     while i < n:
@@ -53,10 +53,10 @@ def _unescape(field: bytes) -> str | None:
         else:
             out += nxt
             i += 2
-    return out.decode("utf-8")
+    return out.decode(codec)
 
 
-def parse_rows(buffer: bytearray, final: bool = False) -> list[tuple]:
+def parse_rows(buffer: bytearray, final: bool = False, codec: str = "utf-8") -> list[tuple]:
     """Consume complete text-format lines from ``buffer``; return them as tuples of str/None."""
     rows: list[tuple] = []
     while True:
@@ -68,7 +68,7 @@ def parse_rows(buffer: bytearray, final: bool = False) -> list[tuple]:
                 return rows
         line = bytes(buffer[:end])
         del buffer[:end + 1]
-        rows.append(tuple(_unescape(f) for f in line.split(b"\t")))
+        rows.append(tuple(_unescape(f, codec) for f in line.split(b"\t")))
 
 
 class Copy:
@@ -89,9 +89,11 @@ class Copy:
     # ---------------------------------------------------------------- context
     def __enter__(self) -> "Copy":
         conn = self._conn
+        conn._reentry_check()
         conn._lock.acquire()
         try:
             self._kind = conn._start_copy(self._query, self._params, self._stack)
+            conn._copy_depth += 1
         except BaseException:
             self._stack.close()
             conn._lock.release()
@@ -123,6 +125,7 @@ class Copy:
             try:
                 self._stack.__exit__(exc_type, exc, tb)
             finally:
+                conn._copy_depth -= 1
                 conn._lock.release()
 
     # ---------------------------------------------------------------- COPY FROM STDIN
@@ -130,6 +133,7 @@ class Copy:
         if self._kind != "in":
             raise errors.ProgrammingError("write() needs a COPY ... FROM STDIN statement")
         if isinstance(data, str):
+            P.check_encodable(self._conn._codec, data)
             data = data.encode("utf-8")
         data = bytes(data)
         for i in range(0, max(len(data), 1), 1 << 20):
@@ -182,5 +186,5 @@ class Copy:
         """Parsed rows (tuples of ``str``/``None``) of a text-format ``COPY ... TO STDOUT``."""
         for chunk in self:
             self._buffer += chunk
-            yield from parse_rows(self._buffer)
-        yield from parse_rows(self._buffer, final=True)
+            yield from parse_rows(self._buffer, codec=self._conn._codec)
+        yield from parse_rows(self._buffer, final=True, codec=self._conn._codec)

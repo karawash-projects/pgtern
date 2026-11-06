@@ -12,6 +12,7 @@ import unicodedata
 from . import errors
 
 MECHANISM = "SCRAM-SHA-256"
+MECHANISM_PLUS = "SCRAM-SHA-256-PLUS"  # the same exchange, bound to the TLS connection (RFC 5929)
 _MAX_ITERATIONS = 1 << 24  # refuse absurd server-chosen costs
 
 
@@ -56,14 +57,19 @@ def _attrs(message: str) -> dict[str, str]:
 
 
 class ScramClient:
-    def __init__(self, password: str, *, username: str = "", nonce: str | None = None) -> None:
+    def __init__(self, password: str, *, username: str = "", nonce: str | None = None,
+                 channel_binding: bytes | None = None) -> None:
+        """``channel_binding``: the tls-server-end-point data of the TLS connection (SCRAM-SHA-256-PLUS),
+        or None for the plain mechanism."""
         self._password = password
         self._nonce = nonce or base64.b64encode(os.urandom(18)).decode()
         self._first_bare = f"n={username},r={self._nonce}"
+        self._channel_binding = channel_binding
+        self._gs2 = "p=tls-server-end-point,," if channel_binding is not None else "n,,"
         self._server_signature = b""
 
     def client_first(self) -> bytes:
-        return ("n,," + self._first_bare).encode()
+        return (self._gs2 + self._first_bare).encode()
 
     def client_final(self, server_first: bytes) -> bytes:
         text = server_first.decode()
@@ -71,17 +77,22 @@ class ScramClient:
         if "e" in attrs:
             raise errors.OperationalError(f"SCRAM authentication failed: {attrs['e']}")
         try:
-            server_nonce, salt, iterations = attrs["r"], base64.b64decode(attrs["s"]), int(attrs["i"])
+            server_nonce = attrs["r"]
+            salt = base64.b64decode(attrs["s"], validate=True)
+            iterations = int(attrs["i"])
         except (KeyError, ValueError) as exc:
             raise errors.OperationalError("malformed SCRAM server-first-message") from exc
-        if not server_nonce.startswith(self._nonce):
+        if len(server_nonce) <= len(self._nonce) or not server_nonce.startswith(self._nonce):
             raise errors.OperationalError("SCRAM server nonce does not extend the client nonce")
+        if not all(0x21 <= ord(ch) <= 0x7E and ch != "," for ch in server_nonce):
+            raise errors.OperationalError("SCRAM server nonce has characters the protocol does not allow")
         if not 1 <= iterations <= _MAX_ITERATIONS:
             raise errors.OperationalError(f"unacceptable SCRAM iteration count {iterations}")
         salted = hashlib.pbkdf2_hmac("sha256", saslprep(self._password).encode(), salt, iterations)
         client_key = hmac.digest(salted, b"Client Key", "sha256")
         stored_key = hashlib.sha256(client_key).digest()
-        without_proof = f"c=biws,r={server_nonce}"
+        cbind = base64.b64encode(self._gs2.encode() + (self._channel_binding or b"")).decode()  # "biws" without binding
+        without_proof = f"c={cbind},r={server_nonce}"
         auth_message = f"{self._first_bare},{text},{without_proof}".encode()
         signature = hmac.digest(stored_key, auth_message, "sha256")
         proof = bytes(a ^ b for a, b in zip(client_key, signature))
@@ -94,7 +105,7 @@ class ScramClient:
         if "e" in attrs:
             raise errors.OperationalError(f"SCRAM authentication failed: {attrs['e']}")
         try:
-            received = base64.b64decode(attrs["v"])
+            received = base64.b64decode(attrs["v"], validate=True)
         except (KeyError, ValueError) as exc:
             raise errors.OperationalError("malformed SCRAM server-final-message") from exc
         if not self._server_signature or not received:

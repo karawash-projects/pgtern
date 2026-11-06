@@ -2,6 +2,7 @@
 """Integration tests against a real PostgreSQL (see scripts/start-test-postgres.sh)."""
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -76,6 +77,8 @@ def test_tls_modes():
 
 def test_tls_only_user_needs_tls():
     _needs_tls_server()
+    if not os.environ.get("PGTERN_TEST_AUTH_ROLES"):
+        pytest.skip("needs the local auth cluster: set PGTERN_TEST_AUTH_ROLES=1")
     with pgtern.connect(url("tlsuser", "tlspw", sslmode="require")) as c:
         assert _ssl_in_use(c)
     with pytest.raises(pgtern.OperationalError):

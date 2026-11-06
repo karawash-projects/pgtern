@@ -182,7 +182,7 @@ def _literal(value: Any) -> str:
     if isinstance(value, str):
         return quote_literal(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
-        return "'\\x" + binascii.hexlify(bytes(value)).decode() + "'::bytea"
+        return "decode('" + binascii.hexlify(bytes(value)).decode() + "', 'hex')"  # no backslash for the server to read
     if isinstance(value, datetime):
         return quote_literal(value.isoformat(" ")) + ("::timestamptz" if value.tzinfo else "::timestamp")
     if isinstance(value, date):

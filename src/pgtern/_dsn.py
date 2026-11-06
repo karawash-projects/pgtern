@@ -13,6 +13,7 @@ from . import errors
 SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
 REQUIRE_AUTH = ("scram-sha-256",)
 TARGET_SESSION_ATTRS = ("any", "read-write", "read-only", "primary", "standby", "prefer-standby")
+DEFAULT_CONNECT_TIMEOUT = 30.0  # seconds for the whole connect; connect_timeout=0 means no limit
 
 _ENV = {
     "host": "PGHOST", "hostaddr": "PGHOSTADDR", "port": "PGPORT", "user": "PGUSER", "password": "PGPASSWORD",
@@ -274,7 +275,7 @@ def build_params(conninfo: str = "", **kwargs: object) -> ConnParams:
         raise errors.ProgrammingError(f"invalid target_session_attrs value {attrs!r}")
     timeout_text = values.get("connect_timeout")
     try:
-        timeout = float(timeout_text) if timeout_text else None
+        timeout = DEFAULT_CONNECT_TIMEOUT if timeout_text is None or timeout_text == "" else float(timeout_text)
     except ValueError:
         raise errors.ProgrammingError(f"invalid connect_timeout {timeout_text!r}") from None
     return ConnParams(
@@ -288,7 +289,7 @@ def build_params(conninfo: str = "", **kwargs: object) -> ConnParams:
         sslkey=values.get("sslkey") or None,
         sslcrl=values.get("sslcrl") or None,
         sslpassword=values.get("sslpassword") or None,
-        connect_timeout=timeout if timeout and timeout > 0 else None,
+        connect_timeout=timeout if timeout > 0 else None,
         application_name=values.get("application_name") or None,
         options=values.get("options") or None,
         require_auth=require_auth,

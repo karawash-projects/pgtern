@@ -27,12 +27,12 @@ from . import _binary
 from . import _protocol as P
 from . import _query, _types, errors, hooks
 from ._conn import (
-    _BROKEN, _IDLE, PRIME_SQL, ConnectionInfo, _ssl_context,
+    _BROKEN, _DDL, _IDLE, PRIME_SQL, ConnectionInfo, _ssl_context,
 )
 from ._copy import format_row, parse_rows
 from ._cursor import Cursor
 from ._dsn import ConnParams, build_params, resolve_password
-from ._auth import Authenticator
+from ._auth import Authenticator, channel_binding_data
 from .pipeline import _enter_hooks, _encode, _exit_hooks, _Item
 from .pool import PoolClosed, PoolTimeout
 from .rows import tuple_row
@@ -44,9 +44,47 @@ __all__ = ["connect", "AsyncConnection", "AsyncCursor", "AsyncServerCursor", "As
            "AsyncCopy", "AsyncConnectionPool"]
 
 
-def _buffered(reader: asyncio.StreamReader) -> int:
+class _TrackedReader(asyncio.StreamReader):
+    """A StreamReader that counts the bytes it has received but not yet handed out.
+
+    asyncio keeps those bytes in a private buffer with no public length, so the count is kept here.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending = 0
+
+    def feed_data(self, data: Any) -> None:  # bytes in practice; asyncio's annotation is wider
+        self.pending += len(data)
+        super().feed_data(data)
+
+    async def read(self, n: int = -1) -> bytes:
+        data = await super().read(n)
+        self.pending -= len(data)
+        return data
+
+    async def readexactly(self, n: int) -> bytes:
+        data = await super().readexactly(n)
+        self.pending -= len(data)
+        return data
+
+
+async def _open_streams(*, unix_path: str | None = None, host: str = "", port: int = 0
+                        ) -> tuple[_TrackedReader, asyncio.StreamWriter]:
+    """asyncio.open_connection, but with a reader that knows how much is unread."""
+    loop = asyncio.get_running_loop()
+    reader = _TrackedReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    if unix_path is not None:
+        transport, _ = await loop.create_unix_connection(lambda: protocol, unix_path)
+    else:
+        transport, _ = await loop.create_connection(lambda: protocol, host, port)
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+
+def _buffered(reader: _TrackedReader) -> int:
     """Bytes the stream has read from the socket but not handed out yet."""
-    return len(getattr(reader, "_buffer", b""))  # asyncio keeps them in a private buffer; there is no public accessor
+    return reader.pending
 
 
 def _tune_keepalive(sock: socket.socket) -> None:
@@ -64,9 +102,9 @@ async def _send_cancel_async(host: str, port: int, pid: int, secret: int, tls_mo
     unix = host.startswith("/")
     try:
         if unix:
-            reader, writer = await asyncio.open_unix_connection(f"{host}/.s.PGSQL.{port}")
+            reader, writer = await _open_streams(unix_path=f"{host}/.s.PGSQL.{port}")
         else:
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await _open_streams(host=host, port=port)
     except OSError as exc:
         raise errors.OperationalError(f'cancel request: connection to server at "{host}", port {port} failed: {exc}') from exc
     try:
@@ -90,6 +128,8 @@ class AsyncCursor(Cursor):
 
     async def execute(self, query: Any, params: Any = None, *, prepare: bool | None = None,  # type: ignore[override]
                       binary: bool | None = None) -> "AsyncCursor":
+        if prepare:
+            raise errors.NotSupportedError("prepare=True is not supported: pgtern runs statements unnamed")
         if self._closed:
             raise errors.InterfaceError("the cursor is closed")
         self._set_results(await self.connection._execute(query, params, bool(binary)))
@@ -234,6 +274,7 @@ class AsyncTransaction:
 
     async def __aenter__(self) -> "AsyncTransaction":
         conn = self._conn
+        conn._reentry_check()
         async with conn._lock:
             conn._check_open()
             if conn._tx_status == _IDLE:
@@ -278,9 +319,11 @@ class AsyncCopy:
 
     async def __aenter__(self) -> "AsyncCopy":
         conn = self._conn
+        conn._reentry_check()
         await conn._lock.acquire()
         try:
             self._kind = await conn._start_copy(self._query, self._params, self._stack)
+            conn._copy_depth += 1
         except BaseException:
             await self._stack.aclose()
             conn._lock.release()
@@ -319,11 +362,14 @@ class AsyncCopy:
             try:
                 await self._stack.__aexit__(exc_type, exc, tb)
             finally:
+                conn._copy_depth -= 1
                 conn._lock.release()
 
     async def write(self, data: bytes | bytearray | memoryview | str) -> None:
         if self._kind != "in":
             raise errors.ProgrammingError("write() needs a COPY ... FROM STDIN statement")
+        if isinstance(data, str):
+            P.check_encodable(self._conn._codec, data)
         data = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         for i in range(0, max(len(data), 1), 1 << 20):
             await self._conn._send(P.copy_data(data[i:i + (1 << 20)]))
@@ -364,9 +410,9 @@ class AsyncCopy:
     async def rows(self) -> AsyncIterator[tuple]:
         async for chunk in self:
             self._buffer += chunk
-            for row in parse_rows(self._buffer):
+            for row in parse_rows(self._buffer, codec=self._conn._codec):
                 yield row
-        for row in parse_rows(self._buffer, final=True):
+        for row in parse_rows(self._buffer, final=True, codec=self._conn._codec):
             yield row
 
 
@@ -382,7 +428,7 @@ class AsyncConnection:
         self.row_factory = row_factory or tuple_row
         self._default_row_factory = self.row_factory
         self._lock = asyncio.Lock()
-        self._reader: asyncio.StreamReader | None = None
+        self._reader: _TrackedReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._closed = True
         self._parser = P.MessageParser()
@@ -395,8 +441,11 @@ class AsyncConnection:
         self._tx_depth = 0
         self._savepoint_ids = itertools.count(1)
         self._host, self._port = "", 0
-        self._dates_ok = True
         self._notice_handlers: list[Callable] = []
+        self._copy_depth = 0
+        self._handler_depth = 0
+        self.max_result_bytes: int | None = None  # None: no cap; see the README
+        self._auth: Authenticator | None = None  # the last login's state (its SASL mechanism, for inspection)
         self._notify_handlers: list[Callable] = []
         self._notifies: collections.deque[P.Notify] = collections.deque()
         self._loader_cache: dict[int, Any] = {}
@@ -422,7 +471,7 @@ class AsyncConnection:
             for index, (host, port) in enumerate(self._params.hosts):
                 addr = self._params.hostaddrs[index] if index < len(self._params.hostaddrs) else None
                 for mode in modes:
-                    try:
+                    try:  # connect_timeout bounds one attempt at one host, as in the sync client
                         await asyncio.wait_for(self._connect_host(host, port, mode, addr),
                                                self._params.connect_timeout)
                         return
@@ -448,9 +497,9 @@ class AsyncConnection:
         unix = host.startswith("/")
         try:
             if unix:
-                reader, writer = await asyncio.open_unix_connection(f"{host}/.s.PGSQL.{port}")
+                reader, writer = await _open_streams(unix_path=f"{host}/.s.PGSQL.{port}")
             else:
-                reader, writer = await asyncio.open_connection(addr or host, port)
+                reader, writer = await _open_streams(host=addr or host, port=port)
                 sock = writer.get_extra_info("socket")
                 if sock is not None:
                     _tune_keepalive(sock)
@@ -490,7 +539,20 @@ class AsyncConnection:
                     f'SSL connection to server at "{host}", port {port} failed: {exc}') from exc
         await self._startup()
         await self._check_session_attrs()
-        self._dates_ok = self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
+
+    @property
+    def _dates_ok(self) -> bool:
+        """Live: SET DateStyle changes it, and the server reports every change."""
+        return self._server_params.get("DateStyle", "ISO").upper().startswith("ISO")
+
+    @property
+    def _codec(self) -> str:
+        return _types.text_codec(self._server_params.get("client_encoding", "UTF8"))
+
+    def _before_send(self, sql: str, params: Any) -> None:
+        P.check_encodable(self._codec, sql, params)
+        if _DDL.match(sql):  # a type may have changed under the same name: forget the cached loaders
+            self._loader_cache.clear()
 
     async def _check_session_attrs(self) -> None:
         want = self._session_requirement
@@ -512,9 +574,12 @@ class AsyncConnection:
             startup["options"] = p.options
         await self._send(P.startup_message(startup))
         encrypted = self._tls_mode is not None or self._host.startswith("/")
+        ssl_object = self._writer.get_extra_info("ssl_object") if self._tls_mode is not None and self._writer else None
+        binding = channel_binding_data(ssl_object) if ssl_object is not None else None
         auth = Authenticator(p.user, resolve_password(p, self._host, self._port), encrypted=encrypted,
                              allow_plaintext=p.sslmode == "disable",
-                             require_scram=p.require_auth == "scram-sha-256")
+                             require_scram=p.require_auth == "scram-sha-256", channel_binding=binding)
+        self._auth = auth
         while True:
             tag, payload = await self._next_message()
             if tag == 0x52:  # R Authentication*
@@ -601,10 +666,29 @@ class AsyncConnection:
             self._pending.extend(self._parser.feed(data))
         return self._pending.popleft()
 
+    def _reentry_check(self) -> None:
+        """Refuse a query made from inside a COPY block or a notice/notify handler: the reply is still
+        being read there, so a second statement would break the protocol (sync) or deadlock (async)."""
+        if self._copy_depth or self._handler_depth:
+            raise errors.ProgrammingError(
+                "can't use the connection inside a COPY block or a notice/notify handler: "
+                "run the statement after the block, or outside the handler")
+
+    def _dispatch(self, handler: Callable, arg: Any) -> None:
+        """Run a user handler. Its exceptions are logged, never raised through the reply reader,
+        which would leave the rest of the reply unread."""
+        self._handler_depth += 1
+        try:
+            handler(arg)
+        except Exception:
+            log.exception("exception in a notice or notify handler")
+        finally:
+            self._handler_depth -= 1
+
     def _notice(self, payload: bytes) -> None:
         diag = errors.Diagnostic(P.parse_error_fields(payload))
         for handler in self._notice_handlers:
-            handler(diag)
+            self._dispatch(handler, diag)
         if not self._notice_handlers:
             log.debug("server notice: %s", diag.message_primary)
 
@@ -624,7 +708,7 @@ class AsyncConnection:
             note = P.parse_notification(payload)
             if self._notify_handlers:
                 for handler in self._notify_handlers:
-                    handler(note)
+                    self._dispatch(handler, note)
             else:
                 self._notifies.append(note)
 
@@ -632,6 +716,7 @@ class AsyncConnection:
         """``async for note in conn.notifies(timeout=5): ...`` (after ``LISTEN``)."""
         count = 0
         while stop_after is None or count < stop_after:
+            self._reentry_check()
             async with self._lock:
                 self._check_open()
                 if not self._notifies:
@@ -672,7 +757,7 @@ class AsyncConnection:
         return self._pending.popleft()
 
     async def _read_cycle(self) -> list[P.Result]:
-        collector = P.QueryCollector()
+        collector = P.QueryCollector(self.max_result_bytes)
         error: dict[str, str] | None = None
         unsupported = False
         while True:
@@ -699,6 +784,8 @@ class AsyncConnection:
             raise errors.NotSupportedError("COPY must be run with cursor.copy(), not execute()")
         if error is not None:
             raise errors.error_from_fields(error)
+        if collector.error is not None:
+            raise collector.error
         return collector.results
 
     def _check_open(self) -> None:
@@ -715,17 +802,12 @@ class AsyncConnection:
         if reader.at_eof() or writer.is_closing() or reader.exception() is not None:
             self._mark_broken()
             return False
-        # An idle connection must have nothing buffered. If the server shut it down, its FATAL
-        # ErrorResponse is sitting in the buffer (and at_eof() is False until it is read).
-        buffered = bytes(getattr(reader, "_buffer", b""))
-        if buffered:
-            try:
-                if any(tag == 0x45 for tag, _ in P.MessageParser().feed(buffered)):
-                    self._mark_broken()
-                    return False
-            except errors.Error:
-                self._mark_broken()
-                return False
+        # An idle connection has nothing unread. If the server shut it down, its FATAL ErrorResponse is
+        # waiting unread (at_eof() stays False until it is read). Discarding on any unread byte is the safe
+        # choice; the cost is that a pooled connection that got a NOTIFY while idle is replaced.
+        if _buffered(reader):
+            self._mark_broken()
+            return False
         return True
 
     # ---------------------------------------------------------------- execution
@@ -734,6 +816,7 @@ class AsyncConnection:
         return await self._read_cycle()
 
     async def _send_query(self, sql: str, params: Any, *, inline: bool = False) -> None:
+        self._before_send(sql, params)
         begin = not self._autocommit and self._tx_status == _IDLE
         if inline and params is not None:
             sql, params = _query.translate(sql, params, _types.render_literal)[0], None
@@ -835,6 +918,7 @@ class AsyncConnection:
         return param_oids, columns
 
     async def _run_binary(self, sql: str, params: Any) -> list[P.Result]:
+        self._before_send(sql, params)
         begin = not self._autocommit and self._tx_status == _IDLE
         if begin:
             await self._simple("BEGIN")
@@ -873,6 +957,7 @@ class AsyncConnection:
     async def _execute(self, query: Any, params: Any, binary: bool = False) -> list[P.Result]:
         sql, redacted = self._query_text(query)
         run = self._run_binary if binary else self._run_text
+        self._reentry_check()
         async with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -884,7 +969,7 @@ class AsyncConnection:
                 with ExitStack() as stack:
                     for hook in tuple(hooks._HOOKS):
                         try:
-                            stack.enter_context(hook(info))
+                            stack.enter_context(hooks.guarded(hook(info)))
                         except Exception:
                             log.exception("a pgtern query hook failed on entry; ignoring it")
                     results = await run(sql, params)
@@ -904,6 +989,7 @@ class AsyncConnection:
         pg_sql, redacted = self._query_text(sql)
         if P.COPY_START.match(pg_sql):
             raise errors.ProgrammingError("COPY can't be used with executemany; use cursor.copy() instead")
+        self._reentry_check()
         async with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -923,7 +1009,7 @@ class AsyncConnection:
                     info = hooks.QueryInfo(redacted, self._host, self._port, self._params.dbname, self._params.user)
                     for hook in tuple(hooks._HOOKS):
                         try:
-                            stack.enter_context(hook(info))
+                            stack.enter_context(hooks.guarded(hook(info)))
                         except Exception:
                             log.exception("a pgtern query hook failed on entry; ignoring it")
                 return stack, info
@@ -948,6 +1034,7 @@ class AsyncConnection:
                 pending: list[bytes] = []  # encoded statements not yet handed to the socket
                 unread = 0  # bytes sent since the replies were last read
                 for params in params_seq:
+                    self._before_send(sql, params)
                     body = _encode(pg_sql, params)  # no Sync: the batch ends with one
                     pending.append(body)
                     unread += len(body)
@@ -1026,6 +1113,8 @@ class AsyncConnection:
 
     async def execute(self, query: Any, params: Any = None, *, prepare: bool | None = None,
                       binary: bool | None = None) -> AsyncCursor:
+        if prepare:
+            raise errors.NotSupportedError("prepare=True is not supported: pgtern runs statements unnamed")
         return await self.cursor().execute(query, params, binary=bool(binary))
 
     @property
@@ -1037,12 +1126,14 @@ class AsyncConnection:
         return self._autocommit
 
     async def set_autocommit(self, value: bool) -> None:
+        self._reentry_check()
         async with self._lock:
             if bool(value) != self._autocommit and self._tx_status not in (_IDLE, _BROKEN):
                 raise errors.ProgrammingError("can't change 'autocommit' now: connection in a transaction")
             self._autocommit = bool(value)
 
     async def commit(self) -> None:
+        self._reentry_check()
         async with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -1052,6 +1143,7 @@ class AsyncConnection:
                 await self._commit_or_fail()
 
     async def rollback(self) -> None:
+        self._reentry_check()
         async with self._lock:
             self._check_open()
             self._check_no_pipeline()
@@ -1161,6 +1253,7 @@ class AsyncPipeline:
 
     async def __aenter__(self) -> "AsyncPipeline":
         conn = self._conn
+        conn._reentry_check()
         async with conn._lock:
             conn._check_open()
             if conn._pipeline is not None:
@@ -1191,6 +1284,7 @@ class AsyncPipeline:
         conn = self._conn
         if self._open and (len(self._queue) >= self._batch_size or self._queued_bytes >= P.FLUSH_BYTES):
             await self.sync()  # before taking the lock: sync() takes it itself
+        conn._reentry_check()
         async with conn._lock:
             conn._check_open()
             if not self._open:
@@ -1205,6 +1299,7 @@ class AsyncPipeline:
                 self._begin_queued = True
             cursor = AsyncCursor(conn)
             cursor._pipeline_pending = True
+            conn._before_send(sql, params)
             body = _encode(sql, params)
             await conn._send(body)
             self._queued_bytes += len(body)
@@ -1243,6 +1338,7 @@ class AsyncPipeline:
 
     async def sync(self) -> None:
         conn = self._conn
+        conn._reentry_check()
         async with conn._lock:
             conn._check_open()
             items, self._queue = self._queue, []
@@ -1308,7 +1404,7 @@ class AsyncPipeline:
 
     @staticmethod
     async def _read_reply(conn: AsyncConnection) -> tuple[list | None, errors.Error | None]:
-        collector = P.QueryCollector()
+        collector = P.QueryCollector(conn.max_result_bytes)
         while True:
             tag, payload = await conn._next_message()
             if tag == 0x45:
@@ -1319,7 +1415,7 @@ class AsyncPipeline:
                 return None, errors.error_from_fields(fields)
             if tag in (0x43, 0x49):
                 collector.handle(tag, payload)
-                return collector.results, None
+                return (None, collector.error) if collector.error is not None else (collector.results, None)
             if tag in (0x4E, 0x53, 0x41):
                 conn._handle_async_message(tag, payload)
             else:
@@ -1349,6 +1445,7 @@ class AsyncConnectionPool:
         self.min_size, self.max_size = min_size, max_size
         self.timeout, self.max_lifetime, self.max_idle = timeout, max_lifetime, max_idle
         self.name = name or f"apool-{id(self):x}"
+        self._pid = os.getpid()
         self._check = check
         self._idle: collections.deque[AsyncConnection] = collections.deque()
         self._out: set[AsyncConnection] = set()  # checked out and not yet returned
@@ -1380,6 +1477,22 @@ class AsyncConnectionPool:
 
     async def _new(self) -> AsyncConnection:
         return await connect(self.conninfo, **self.kwargs)
+
+    async def _check_fork(self) -> None:
+        """Before any use: after a fork this process must not touch the parent's connections, locks or
+        event-loop objects. The parent's connections are dropped, not closed (a Terminate from here would
+        end the parent's sessions); a pool that was open is opened again for this process."""
+        if os.getpid() == self._pid:
+            return
+        was_open = not self._closed
+        self._pid = os.getpid()
+        self._idle = collections.deque()
+        self._out = set()
+        self._slots = None  # an asyncio primitive bound to the parent's loop
+        self._closed = True
+        self._maintainer = None
+        if was_open:
+            await self.open()
 
     @staticmethod
     def _mark_idle(conn: AsyncConnection) -> None:
@@ -1417,6 +1530,7 @@ class AsyncConnectionPool:
             self._idle.append(conn)
 
     async def getconn(self, timeout: float | None = None) -> AsyncConnection:
+        await self._check_fork()
         if self._closed or self._slots is None:
             raise PoolClosed("the pool is closed")
         wait = self.timeout if timeout is None else timeout
@@ -1457,6 +1571,7 @@ class AsyncConnectionPool:
             return False
 
     async def putconn(self, conn: AsyncConnection) -> None:
+        await self._check_fork()
         assert self._slots is not None
         if conn not in self._out:  # a second return would also release a second slot
             raise errors.ProgrammingError("this connection was not checked out from the pool, or was already returned")
@@ -1500,6 +1615,7 @@ class AsyncConnectionPool:
             await self.putconn(conn)
 
     async def close(self) -> None:
+        await self._check_fork()
         self._closed = True
         task, self._maintainer = self._maintainer, None
         if task is not None:

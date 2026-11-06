@@ -19,11 +19,14 @@ for ``sql.Composed`` queries any ``sql.Literal`` is replaced by ``?``.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 __all__ = ["QueryInfo", "add_query_hook"]
+
+_log = logging.getLogger("pgtern.hooks")
 
 
 @dataclass
@@ -38,6 +41,33 @@ class QueryInfo:
 
 QueryHook = Callable[[QueryInfo], AbstractContextManager]
 _HOOKS: list[QueryHook] = []
+
+
+class _Guarded(AbstractContextManager):
+    """A hook's context manager, with failures on entry or exit logged rather than raised.
+
+    An exit failure raised into the query made a successful statement look failed, and in executemany it
+    could shift results between statements. Entry failures are already logged and skipped by the driver.
+    """
+
+    __slots__ = ("_cm",)
+
+    def __init__(self, cm: Any) -> None:
+        self._cm = cm
+
+    def __enter__(self) -> Any:
+        return self._cm.__enter__()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            return bool(self._cm.__exit__(exc_type, exc, tb))
+        except Exception:
+            _log.exception("a pgtern query hook failed on exit; ignoring it")
+            return False
+
+
+def guarded(cm: Any) -> AbstractContextManager:
+    return _Guarded(cm)
 
 
 def add_query_hook(hook: QueryHook) -> Callable[[], None]:

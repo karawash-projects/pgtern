@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: pyflakes
+        run: python -m pyflakes src tests
+      - name: mypy (strict-enough for the public API)
+        run: python -m mypy src/pgtern
+
   test:
     name: Python ${{ matrix.python }} · PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-latest
@@ -31,6 +46,8 @@ jobs:
           --health-retries 20
     env:
       PGTERN_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      PGTERN_TEST_HOST: 127.0.0.1
+      PGTERN_TEST_PORT: "5432"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,6 +57,98 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Test
         run: pytest
+
+  infrastructure:
+    # The suites that need more than a service container: a TLS server with SCRAM and auth roles,
+    # a transaction-mode pooler in front of it, and a server that is restarted mid-run.
+    name: TLS, auth roles, pooler and restart (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install PostgreSQL server and pgbouncer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 pgbouncer openssl
+          sudo systemctl stop postgresql || true
+      - name: Start the test cluster (TLS, SCRAM, md5, cleartext, trust, TLS-only roles)
+        env:
+          PGTERN_PGROOT: ${{ runner.temp }}/pgroot
+          PGBIN: /usr/lib/postgresql/16/bin
+          PGTERN_PORT: "54329"
+        run: |
+          scripts/start-test-postgres.sh > "$RUNNER_TEMP/testenv.sh"
+          # GITHUB_ENV takes the value literally, so the quotes around the DSN have to go
+          sed -e 's/^export //' -e 's/"//g' "$RUNNER_TEMP/testenv.sh" >> "$GITHUB_ENV"
+          echo "PGTERN_TEST_RESTART_CMD=/usr/lib/postgresql/16/bin/pg_ctl -D $RUNNER_TEMP/pgroot/data -l $RUNNER_TEMP/pgroot/server.log -w restart -m fast" >> "$GITHUB_ENV"
+      - name: Start pgbouncer in transaction mode
+        run: |
+          cat > "$RUNNER_TEMP/pgbouncer.ini" <<EOF
+          [databases]
+          * = host=127.0.0.1 port=54329
+          [pgbouncer]
+          listen_addr = 127.0.0.1
+          listen_port = 6439
+          auth_type = trust
+          auth_file = $RUNNER_TEMP/userlist.txt
+          pool_mode = transaction
+          default_pool_size = 2
+          max_client_conn = 200
+          server_reset_query =
+          logfile = $RUNNER_TEMP/pgbouncer.log
+          pidfile = $RUNNER_TEMP/pgbouncer.pid
+          ignore_startup_parameters = extra_float_digits,options
+          EOF
+          printf '"postgres" "postgres"\n' > "$RUNNER_TEMP/userlist.txt"
+          pgbouncer -d "$RUNNER_TEMP/pgbouncer.ini"
+          for _ in $(seq 1 20); do (exec 3<>/dev/tcp/127.0.0.1/6439) 2>/dev/null && break; sleep 0.5; done
+          echo "PGTERN_TEST_POOLER_DSN=postgresql://postgres:postgres@127.0.0.1:6439/postgres" >> "$GITHUB_ENV"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Test everything, including the auth, pooler and restart suites
+        env:
+          PGTERN_TEST_AUTH_ROLES: "1"
+        run: pytest -q
+
+  wheel:
+    name: Installed wheel (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGTERN_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      PGTERN_TEST_HOST: 127.0.0.1
+      PGTERN_TEST_PORT: "5432"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Install the wheel into a clean environment and test it from outside the source tree
+        run: |
+          python -m venv "$RUNNER_TEMP/clean"
+          "$RUNNER_TEMP/clean/bin/pip" install dist/*.whl pytest pytest-timeout
+          mkdir "$RUNNER_TEMP/suite"
+          cp -r tests pyproject.toml "$RUNNER_TEMP/suite/"
+          cd "$RUNNER_TEMP/suite"
+          "$RUNNER_TEMP/clean/bin/python" -c "import pgtern, pathlib; assert 'src' not in pathlib.Path(pgtern.__file__).parts; print(pgtern.__file__)"
+          "$RUNNER_TEMP/clean/bin/pytest" -q
 
   build:
     name: Build and check distributions
@@ -57,3 +166,7 @@ jobs:
         run: |
           python -m twine check --strict dist/*
           python -c "import zipfile,glob; w=glob.glob('dist/*.whl')[0]; m=zipfile.ZipFile(w).read([n for n in zipfile.ZipFile(w).namelist() if n.endswith('METADATA')][0]).decode(); req = [l for l in m.splitlines() if l.startswith('Requires-Dist') and 'extra ==' not in l]; assert not req, req; print('zero runtime dependencies: ok')"
+      - name: Forbidden names
+        run: |
+          if grep -rniE "psycopg|libpq|pgbouncer|harnis|anthropic|claude|co-authored-by" --exclude-dir=.git --exclude-dir=dist --exclude-dir=.github .; then echo "forbidden name found"; exit 1; fi
+          echo "no forbidden names"
