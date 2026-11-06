@@ -1,8 +1,9 @@
 # pgtern
 
-**A PostgreSQL client for Python with zero dependencies.**
+[![CI](https://github.com/karawash-projects/pgtern/actions/workflows/ci.yml/badge.svg)](https://github.com/karawash-projects/pgtern/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-pgtern speaks the PostgreSQL wire protocol directly, in pure Python and the standard library only. There is no C library dependency, no C extension and no build step, so `pip install pgtern` is the whole setup. It offers a familiar DB-API style interface in two flavours: blocking, and `asyncio`.
+pgtern is a PostgreSQL client for Python. It speaks the PostgreSQL wire protocol directly and uses only the Python standard library, so there are no runtime dependencies, no C extensions and no build step. It provides a DB-API style interface in two forms: blocking, and `asyncio`.
 
 ```python
 import pgtern
@@ -27,32 +28,45 @@ async def main():
 asyncio.run(main())
 ```
 
-## Why pgtern
+## Features
 
-- **Nothing to audit but the code you run.** No transitive dependencies means no dependency tree to pin, scan or keep patched. The package is a small, readable, pure-Python wheel.
-- **Installs anywhere Python runs.** No compiler, no system libraries, no architecture-specific binaries. Containers, minimal images and locked-down hosts all get the same package.
-- **Secure by default, with stated limits.** The server must prove it knows the password before a SCRAM login is accepted. A password is never sent in plaintext unless you chose `sslmode=disable`, so a server that declines TLS under `prefer` cannot collect it. `verify-ca` and `verify-full` require a root certificate (`sslrootcert`), and fail rather than fall back to the system store. Over TLS the login is bound to that connection with SCRAM-SHA-256-PLUS (`tls-server-end-point`, RFC 5929), so a login relayed through another connection fails.
-- **Blocking and async, one API.** The same concepts, names and behaviour in `pgtern` and `pgtern.aio`, including pools, transactions, COPY and notifications.
-- **Fast bulk writes.** `executemany` sends a whole batch as a single pipelined transaction. In measurements on PostgreSQL 16 it ran about five times faster than a row-by-row loop, both blocking and async.
-- **Built for modern deployments.** It uses unnamed prepared statements only, so it cooperates with transaction-mode connection poolers. Pools check connections before handing them out and replace any the server has closed.
+- No runtime dependencies. The package is a pure-Python wheel for Python 3.11 and newer.
+- Blocking and `asyncio` APIs with the same names and behaviour, including pools, transactions, `COPY`, notifications and pipelines.
+- SCRAM-SHA-256 authentication, and SCRAM-SHA-256-PLUS channel binding over TLS.
+- TLS modes `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`.
+- Connection pools with liveness checks, idle and lifetime limits, and a fork-safe reset.
+- Parameters are always sent separately from the SQL text. A helper module composes identifiers and literals safely.
+- Opt-in binary result format for common types, and text format for everything else.
+- Server-side cursors for large results, and batched `executemany`.
+- Query hooks for logging, timing and tracing. They never receive bound parameter values.
+- Exceptions organised by SQLSTATE class.
 
-## Install
+## Installation
 
 ```
 pip install pgtern
 ```
 
-Requires Python 3.11 or newer.
+pgtern requires Python 3.11 or newer.
 
 ## Connecting
 
-`pgtern.connect` accepts URL and key=value DSNs, the standard `PG*` environment variables, Unix sockets, and a list of hosts for failover.
+`pgtern.connect` accepts URL and key=value connection strings, the standard `PG*` environment variables, Unix sockets, and a list of hosts for failover.
 
 ```python
 conn = pgtern.connect("postgresql://app@db1.internal,db2.internal/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem")
 ```
 
-TLS modes follow the PostgreSQL convention: `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`. Authentication supports SCRAM-SHA-256, MD5, cleartext and trust. Under `allow` and `prefer` the client refuses MD5 and cleartext passwords on an unencrypted connection; under `disable` it sends them, because you asked for no encryption. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including trust. Failover moves to the next host on any startup failure, including timeouts during TLS negotiation. Passwords can come from a `.pgpass` file (`PGPASSFILE` or `~/.pgpass`); a file readable by other users is ignored, as the PostgreSQL client tools do. `target_session_attrs` (`read-write`, `read-only`, `primary`, `standby`, `prefer-standby`) skips servers that do not match, `hostaddr` connects to an address while keeping the host name for certificate checks, and `sslpassword` and `sslcrl` are supported. `connect_timeout` (default 30 seconds, `0` for no limit) bounds each attempt at one host, from the socket to the end of startup, so failover still reaches the next host.
+TLS follows the PostgreSQL conventions. Under `allow` and `prefer`, the client refuses to send MD5 or cleartext passwords over an unencrypted connection. Under `disable` it sends them, because encryption was explicitly turned off. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including servers that allow trust authentication.
+
+Failover moves to the next host after any startup failure, including a timeout during TLS negotiation. Passwords can come from a `.pgpass` file (`PGPASSFILE` or `~/.pgpass`). A password file that other users can read is ignored.
+
+Other supported options:
+
+- `target_session_attrs`: `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`.
+- `hostaddr`: connect to an address while keeping the host name for certificate checks.
+- `sslpassword` and `sslcrl`.
+- `connect_timeout`: seconds allowed for each host attempt, from opening the socket to the end of startup. The default is 30. `0` means no limit.
 
 ## Queries and transactions
 
@@ -69,10 +83,9 @@ with pgtern.connect(dsn) as conn:
         print(row)
 ```
 
-Parameters use `%s` placeholders and are always sent separately from the SQL text. The `sql` module composes identifiers and literals safely:
+Placeholders are `%s`. Values are sent as parameters, never interpolated into the SQL text. To build identifiers and literals safely, use the `sql` module:
 
 ```python
-import pgtern
 from pgtern import sql
 
 with pgtern.connect(dsn) as conn:
@@ -80,20 +93,20 @@ with pgtern.connect(dsn) as conn:
     conn.execute(query, [1])
 ```
 
-## Rows
+## Row formats
 
-Choose how rows come back with a row factory: `tuple_row` (the default), `dict_row`, or `namedtuple_row`. Pass one to `connect` or to a single cursor.
+Choose how rows are returned with a row factory: `tuple_row` (the default), `dict_row` or `namedtuple_row`. Pass one to `connect`, or to a single cursor.
 
 ## Bulk loading
 
-`executemany` sends the whole batch as one pipelined transaction. In autocommit mode a failing row rolls back the entire batch; inside a transaction it aborts that transaction, as usual.
+`executemany` sends the whole batch as one pipelined transaction. In autocommit mode, a failing row rolls back the entire batch. Inside a transaction, it aborts that transaction as usual.
 
 ```python
 with pgtern.connect(dsn, autocommit=True) as conn:
     conn.cursor().executemany("INSERT INTO events (kind, payload) VALUES (%s, %s)", rows)
 ```
 
-For the fastest loads, use `COPY`:
+For the largest loads, use `COPY`:
 
 ```python
 with pgtern.connect(dsn) as conn:
@@ -102,11 +115,11 @@ with pgtern.connect(dsn) as conn:
             copy.write_row((kind, payload))
 ```
 
-Exporting works the same way with `COPY ... TO STDOUT`, read through `for chunk in copy` or `copy.rows()`.
+Export uses `COPY ... TO STDOUT`, read with `for chunk in copy` or `copy.rows()`.
 
 ## Streaming large results
 
-A named cursor runs on the server and fetches in batches, so a result never has to fit in memory:
+A named cursor runs on the server and fetches rows in batches, so a result never has to fit in memory:
 
 ```python
 with pgtern.connect(dsn) as conn:
@@ -120,7 +133,7 @@ with pgtern.connect(dsn) as conn:
 
 Server-side cursors support `scrollable`, `withhold` and `scroll()`.
 
-## Real-time notifications
+## Notifications
 
 ```python
 with pgtern.connect(dsn) as conn:
@@ -129,33 +142,9 @@ with pgtern.connect(dsn) as conn:
         print(note.channel, note.payload)
 ```
 
-The asyncio connection supports `async for` over the same notifications. Session features such as `LISTEN` run on a direct or session-mode connection.
+The async connection provides the same notifications through `async for`. `LISTEN` needs a session that stays on one server connection, so use a direct connection or session-mode pooling for it.
 
-## Values
-
-Python `int` parameters are sent as `int4`, `int8` or `numeric` by size. A `smallint` parameter is never inferred from a Python int, so use an explicit cast (`%s::smallint`) for a function that only takes `smallint`.
-
-An interval with months or years decodes to `pgtern.Interval(months, delta)`, because a month is not a fixed number of days. Intervals without months decode to `timedelta`, as before.
-
-`timestamptz` values come back in UTC, in both text and binary format, so the two formats give the same value and the same `tzinfo`. `time` values written as `24:00:00` raise `DataError` in both formats, because Python has no such time. A `float4` parameter outside its range goes to the server as text, which reports the error.
-
-Dates and times follow the session's `DateStyle` and text the session's `client_encoding` as the server reports them after every `SET`. Text that cannot be sent in the session's encoding (non-ASCII text under a non-UTF-8 `client_encoding`) raises `NotSupportedError` before anything is sent.
-
-Placeholders are `%s` only. `%b` and `%t` are refused. `prepare=True` raises `NotSupportedError`, because statements always run unnamed; `prepare=False` is accepted.
-
-## Limits and safety
-
-`max_result_bytes` (a connection attribute, `None` by default) caps how many bytes of rows one statement may return. Past the cap, the rest of the reply is read and discarded, the connection stays usable, and the statement raises `DataError`. Results are otherwise held in memory, so stream large results with a server-side cursor.
-
-A query hook that fails on entry or exit is logged and ignored, so it never changes the result of a statement. A notice or notify handler that raises is logged too. Using the connection from inside a COPY block or from inside a handler raises `ProgrammingError` at once, instead of breaking the protocol or deadlocking.
-
-## Forking
-
-A connection must not be used across `fork()`: a forked child that uses an inherited connection gets `OperationalError`. A pool is different: after a fork, its first use in the child drops the parent's connections without closing them (a Terminate from the child would end the parent's sessions), then opens its own. Forked children never share the parent's sockets.
-
-## Binary format and pipelines
-
-Opt into binary transfer per statement with `binary=True`. It covers integers, floats, booleans, text, bytea, uuid, dates and times, intervals, json/jsonb, numeric results and one-dimensional arrays of these. Other types keep using text.
+## Pipelines
 
 Pipeline mode sends many statements before reading any reply:
 
@@ -167,11 +156,17 @@ with pgtern.connect(dsn) as conn:
     print(b.fetchone())    # results are ready once the block ends
 ```
 
-Statements are read in order at each sync point (`pipe.sync()`, the end of the block, or every `batch_size` statements). A sync point raises the first failure in its batch, so a failed statement cannot pass silently. With `autocommit=True` a sync point is a commit point, so the statements in one batch succeed or fail together. Statements after a failure are skipped and raise `pgtern.errors.PipelineAborted`. If the block exits with an exception under autocommit, the batch is rolled back, not committed. COPY cannot be used inside a pipeline or executemany.
+Replies are read in order at each sync point: `pipe.sync()`, the end of the block, or every `batch_size` statements. A sync point raises the first failure in its batch, so a failed statement cannot pass silently. Under autocommit, a sync point is also a commit point, so the statements in one batch succeed or fail together. If the block exits with an exception under autocommit, the batch is rolled back. Statements after a failure raise `pgtern.errors.PipelineAborted`. Pipelines support text format only, and `COPY` cannot run inside one.
 
-## Custom types
+## Values and types
 
-Register how a PostgreSQL type becomes a Python value, and how a Python class is sent:
+- Python `int` parameters are sent as `int4`, `int8` or `numeric`, depending on size. Use an explicit cast such as `%s::smallint` when a function takes `smallint`.
+- `timestamptz` values are returned in UTC, in both text and binary format, with the same `tzinfo`.
+- Intervals with months or years decode to `pgtern.Interval(months, delta)`, because a month has no fixed length. Other intervals decode to `timedelta`.
+- `time` values of `24:00:00` raise `DataError`, because Python has no such time.
+- Dates and times follow the session's `DateStyle`, and text follows its `client_encoding`. Both are read from the server after every change. Non-ASCII text under a non-UTF-8 encoding raises `NotSupportedError` before anything is sent.
+
+Register loaders for PostgreSQL types and dumpers for Python classes:
 
 ```python
 from enum import Enum
@@ -181,12 +176,16 @@ class Mood(Enum):
     SAD = "sad"
     HAPPY = "happy"
 
-adapters.register_loader("mood", adapters.enum_loader(Mood))                  # CREATE TYPE mood AS ENUM (...)
-adapters.register_loader("span", adapters.range_loader(int))                  # CREATE TYPE span AS RANGE (subtype = int4)
+adapters.register_loader("mood", adapters.enum_loader(Mood))           # CREATE TYPE mood AS ENUM (...)
+adapters.register_loader("span", adapters.range_loader(int))           # CREATE TYPE span AS RANGE (subtype = int4)
 adapters.register_dumper(Mood, lambda m: m.value)
 ```
 
-Loaders are looked up by type name once per connection and cached. Registering a loader applies to connections opened afterwards, and to pooled connections once they are returned to the pool.
+Loaders are looked up by type name once per connection and cached. A registered loader applies to connections opened afterwards, and to pooled connections when they are next returned to the pool.
+
+## Binary format
+
+Opt in per statement with `binary=True`. It covers integers, floats, booleans, text, `bytea`, `uuid`, dates, times, intervals, `json` and `jsonb`, `numeric` results, and one-dimensional arrays of these. Other types use text.
 
 ## Pools
 
@@ -198,16 +197,20 @@ with pool.connection() as conn:
     conn.execute("SELECT 1")
 ```
 
-Pools keep `min_size` connections warm and grow to `max_size` on demand. The async pool keeps `min_size` open with a background task, and retires connections idle longer than `max_idle`. A connection is checked for liveness each time it is handed out, rolled back if it comes back mid-transaction, and replaced when the server has closed it. Waiting callers receive `pgtern.PoolTimeout` after `timeout` seconds.
+A pool keeps `min_size` connections open and grows up to `max_size` on demand. The async pool keeps `min_size` open with a background task, and retires connections that have been idle longer than `max_idle` while the pool is above `min_size`. A connection is checked for liveness when it is handed out, rolled back if it was returned in the middle of a transaction, and replaced if the server has closed it. A caller that waits longer than `timeout` seconds receives `pgtern.PoolTimeout`.
 
-## Observability
+## Forking
 
-Query hooks see every statement and its row count, without ever seeing bound parameter values:
+Do not use a connection across `fork()`. A forked child that uses an inherited connection gets `OperationalError`. A pool resets itself in the child: on first use it discards the parent's connections without closing them, which would otherwise end the parent's sessions, and then opens its own.
+
+## Query hooks
+
+A hook sees every statement, its row count and the connection target. It never sees bound parameter values:
 
 ```python
 from contextlib import contextmanager
-import pgtern
 import time
+import pgtern
 
 @contextmanager
 def timing(info):
@@ -220,11 +223,19 @@ def timing(info):
 remove = pgtern.add_query_hook(timing)
 ```
 
-The same hook point works for OpenTelemetry spans, metrics, and audit logging.
+A hook that fails on entry or exit is logged and ignored, so it never changes the result of a statement.
+
+## Limits and safety
+
+- `max_result_bytes` is a connection attribute that caps the bytes one statement may return. It is `None` (no cap) by default. A result over the cap is read and discarded, the connection stays usable, and the statement raises `DataError`. Results are held in memory, so use a server-side cursor for large ones.
+- Using a connection from inside a `COPY` block, or from inside a notice or notify handler, raises `ProgrammingError` at once.
+- A password is not sent in plaintext unless you choose `sslmode=disable`, so a server that declines TLS under `prefer` cannot collect it.
+- Over TLS, the login is bound to that connection with SCRAM-SHA-256-PLUS, so a login relayed through another connection fails.
+- `verify-ca` and `verify-full` require a root certificate (`sslrootcert`). They fail rather than fall back to the system store.
 
 ## Errors
 
-Every error is a subclass of `pgtern.Error`, and each common SQLSTATE has its own class, such as `UniqueViolation` or `DeadlockDetected`. Catch the family you need, or the specific case:
+Every exception derives from `pgtern.Error`. Each common SQLSTATE has its own class, such as `UniqueViolation` or `DeadlockDetected`, and each class also belongs to its broader category, such as `IntegrityError`:
 
 ```python
 with pgtern.connect(dsn) as conn:
@@ -237,7 +248,7 @@ with pgtern.connect(dsn) as conn:
 ## Compatibility
 
 - **PostgreSQL:** 14, 15, 16, 17 and 18.
-- **Python:** 3.11 and newer. The continuous integration workflow runs the test suite on every supported version.
+- **Python:** 3.11, 3.12 and 3.13 are tested in continuous integration.
 - **Platforms:** anywhere CPython runs.
 
 ## Development
@@ -249,14 +260,16 @@ pytest
 scripts/start-test-postgres.sh stop
 ```
 
-Without a server the unit tests still run. The integration tests need `PGTERN_TEST_DSN`; the optional suites read `PGTERN_TEST_POOLER_DSN` (a transaction-mode connection pooler) and `PGTERN_TEST_RESTART_CMD` (a command that restarts the server). See `CONTRIBUTING.md` for the full workflow.
+The unit tests run without a server. The integration tests need `PGTERN_TEST_DSN`. Optional suites read `PGTERN_TEST_POOLER_DSN`, which points at a transaction-mode connection pooler, and `PGTERN_TEST_RESTART_CMD`, a command that restarts the test server.
 
-## Documentation and support
+## Contributing
 
-- Release history: [CHANGELOG.md](CHANGELOG.md)
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Security reports: [SECURITY.md](SECURITY.md)
+See [CONTRIBUTING.md](https://github.com/karawash-projects/pgtern/blob/main/CONTRIBUTING.md). Report security issues privately as described in [SECURITY.md](https://github.com/karawash-projects/pgtern/blob/main/SECURITY.md).
+
+## Changelog
+
+Release history is in [CHANGELOG.md](https://github.com/karawash-projects/pgtern/blob/main/CHANGELOG.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/karawash-projects/pgtern/blob/main/LICENSE).
