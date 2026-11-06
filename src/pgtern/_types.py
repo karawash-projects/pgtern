@@ -214,7 +214,11 @@ def _dec_timestamp(s: str) -> datetime:
 
 
 def _dec_timestamptz(s: str) -> datetime:
-    return _make_timestamp(s, True)
+    """UTC, as the binary format returns it, so both formats give the same value and tzinfo."""
+    try:
+        return _make_timestamp(s, True).astimezone(timezone.utc)
+    except OverflowError:
+        raise errors.DataError(f"can't decode timestamp {s!r}: out of range in UTC") from None
 
 
 def _make_time(s: str, aware: bool) -> time:
@@ -278,8 +282,11 @@ _SCALAR_DECODERS: dict[int, Callable[[str], Any] | None] = {
 _DATE_OIDS = {DATE, TIME, TIMETZ, TIMESTAMP, TIMESTAMPTZ, INTERVAL}
 
 
-def parse_array(text: str, element: Callable[[str], Any] | None) -> list:
-    """Parse a PostgreSQL array literal (any number of dimensions) with ``element`` per item."""
+def parse_array(text: str, element: Callable[[str], Any] | None, delim: str = ",") -> list:
+    """Parse a PostgreSQL array literal (any number of dimensions) with ``element`` per item.
+
+    ``delim`` is the element type's typdelim: ',' for most types, ';' for box.
+    """
     if text.startswith("["):  # explicit bounds, e.g. "[0:1]={a,b}"
         text = text[text.index("=") + 1:]
     root: list = []
@@ -295,7 +302,7 @@ def parse_array(text: str, element: Callable[[str], Any] | None) -> list:
         elif c == "}":
             stack.pop()
             i += 1
-        elif c == ",":
+        elif c == delim:
             i += 1
         elif c == '"':
             i += 1
@@ -310,7 +317,7 @@ def parse_array(text: str, element: Callable[[str], Any] | None) -> list:
             stack[-1].append(token if element is None else element(token))
         else:
             j = i
-            while j < n and text[j] not in ",}":
+            while j < n and text[j] not in (delim, "}"):
                 j += 1
             token = text[i:j]
             i = j
@@ -377,6 +384,8 @@ _LOADERS: dict[str, Callable[[str], Any]] = {}
 
 def _dumper_for(cls: type) -> Callable[[Any], str | None] | None:
     for klass in cls.__mro__:
+        if klass is int and issubclass(cls, bool):  # bool subclasses int, but it is not an int to a dumper
+            break
         fn = _DUMPERS.get(klass)
         if fn is not None:
             return fn
@@ -400,12 +409,13 @@ def _nn(value: bytes | None) -> bytes:
 def resolve_loaders(pg_type_rows: list[list[bytes | None]], cache: dict[int, Any], wanted: Sequence[int]) -> None:
     """Fill ``cache`` (oid -> loader or None) for ``wanted``.
 
-    ``pg_type_rows`` are rows of (oid, nspname, typname, typelem, typcategory) for the wanted
+    ``pg_type_rows`` are rows of (oid, nspname, typname, typelem, typcategory, typdelim) for the wanted
     types and their element types. Arrays get a loader when their element type has one.
     """
-    info: dict[int, tuple[str, str, int, str]] = {}
-    for oid_b, nsp_b, name_b, elem_b, cat_b in pg_type_rows:
-        info[int(_nn(oid_b))] = (_nn(nsp_b).decode(), _nn(name_b).decode(), int(_nn(elem_b)), _nn(cat_b).decode())
+    info: dict[int, tuple[str, str, int, str, str]] = {}
+    for oid_b, nsp_b, name_b, elem_b, cat_b, *delim_b in pg_type_rows:
+        delim = _nn(delim_b[0]).decode() if delim_b and delim_b[0] is not None else ","
+        info[int(_nn(oid_b))] = (_nn(nsp_b).decode(), _nn(name_b).decode(), int(_nn(elem_b)), _nn(cat_b).decode(), delim)
 
     def loader_for(oid: int, depth: int = 0) -> Callable[[str], Any] | None:
         if oid in cache:
@@ -413,11 +423,12 @@ def resolve_loaders(pg_type_rows: list[list[bytes | None]], cache: dict[int, Any
         result: Callable[[str], Any] | None = None
         entry = info.get(oid)
         if entry is not None and depth < 4:
-            nsp, name, elem, cat = entry
+            nsp, name, elem, cat, _delim = entry
             if cat == "A" and elem:
                 element = loader_for(elem, depth + 1)
                 if element is not None:
-                    result = lambda s, _e=element: parse_array(s, _e)  # noqa: E731
+                    elem_delim = info[elem][4] if elem in info else ","
+                    result = lambda s, _e=element, _d=elem_delim: parse_array(s, _e, _d)  # noqa: E731
             if result is None:
                 result = loader_for_name(nsp, name)
         cache[oid] = result
@@ -428,15 +439,40 @@ def resolve_loaders(pg_type_rows: list[list[bytes | None]], cache: dict[int, Any
 
 
 
-def load_row(raw: Sequence[bytes | None], loaders: Sequence[Any]) -> tuple:
+# PostgreSQL client_encoding names -> Python codecs. The server reports the active one after every SET.
+_PG_CODECS = {
+    "UTF8": "utf-8", "SQL_ASCII": "ascii", "LATIN1": "latin-1", "LATIN2": "iso8859_2", "LATIN3": "iso8859_3",
+    "LATIN4": "iso8859_4", "LATIN5": "iso8859_9", "LATIN6": "iso8859_10", "LATIN7": "iso8859_13",
+    "LATIN8": "iso8859_14", "LATIN9": "iso8859_15", "LATIN10": "iso8859_16", "ISO_8859_5": "iso8859_5",
+    "ISO_8859_6": "iso8859_6", "ISO_8859_7": "iso8859_7", "ISO_8859_8": "iso8859_8",
+    "WIN1250": "cp1250", "WIN1251": "cp1251", "WIN1252": "cp1252", "WIN1253": "cp1253", "WIN1254": "cp1254",
+    "WIN1255": "cp1255", "WIN1256": "cp1256", "WIN1257": "cp1257", "WIN1258": "cp1258", "WIN866": "cp866",
+    "KOI8R": "koi8_r", "KOI8U": "koi8_u", "EUC_JP": "euc_jp", "EUC_CN": "gb2312", "EUC_KR": "euc_kr",
+    "SJIS": "shift_jis", "BIG5": "big5", "GBK": "gbk", "GB18030": "gb18030", "JOHAB": "johab", "UHC": "cp949",
+}
+
+
+def text_codec(pg_name: str) -> str:
+    """The Python codec for a server-side client_encoding name."""
+    codec = _PG_CODECS.get(pg_name.upper())
+    if codec is None:
+        raise errors.NotSupportedError(f"client_encoding {pg_name!r} is not supported by pgtern")
+    return codec
+
+
+def load_row(raw: Sequence[bytes | None], loaders: Sequence[Any], codec: str = "utf-8") -> tuple:
     out: list[Any] = []
-    for v, ld in zip(raw, loaders):
-        if v is None:
-            out.append(None)
-        elif type(ld) is BinaryColumn:
-            out.append(ld.fn(v))
-        else:
-            out.append(v.decode() if ld is None else ld(v.decode()))
+    try:
+        for v, ld in zip(raw, loaders):
+            if v is None:
+                out.append(None)
+            elif type(ld) is BinaryColumn:
+                out.append(ld.fn(v))
+            else:
+                out.append(v.decode(codec) if ld is None else ld(v.decode(codec)))
+    except UnicodeDecodeError as exc:
+        raise errors.DataError(
+            f"a text value is not valid {codec} for the session's client_encoding: {exc.reason}") from None
     return tuple(out)
 
 

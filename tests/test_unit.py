@@ -207,7 +207,8 @@ def test_decode_dates_and_times():
     assert dec(1114, "2026-11-01 14:06:05.5") == datetime(2026, 11, 1, 14, 6, 5, 500000)
     assert dec(1184, "2026-11-01 14:06:05.123456+00") == datetime(2026, 11, 1, 14, 6, 5, 123456, tzinfo=timezone.utc)
     aware = dec(1184, "2026-11-01 14:06:05-05:30")
-    assert aware.utcoffset() == -timedelta(hours=5, minutes=30)
+    assert aware == datetime(2026, 11, 1, 19, 36, 5, tzinfo=timezone.utc)  # UTC, as the binary format returns it
+    assert aware.utcoffset() == timedelta(0)
     assert dec(1083, "14:06:05") == time(14, 6, 5)
     assert dec(1266, "14:06:05+02").utcoffset() == timedelta(hours=2)
     assert dec(1186, "1 year 2 mons 3 days 04:05:06.5") == _types.Interval(
@@ -295,6 +296,6 @@ def test_composition_and_redaction():
 def test_literal_values():
     L = lambda v: sql.Literal(v).as_string()  # noqa: E731
     assert L(None) == "NULL" and L(True) == "true" and L(5) == "5" and L(-5) == " -5"
-    assert L("x") == "'x'" and L(b"\x01") == "'\\x01'::bytea"
+    assert L("x") == "'x'" and L(b"\x01") == "decode('01', 'hex')"
     assert L([1, 2]) == "ARRAY[1,2]" and L([]) == "'{}'"
     assert L(float("nan")) == "'NaN'::float8"

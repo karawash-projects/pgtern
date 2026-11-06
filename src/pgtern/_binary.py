@@ -85,6 +85,8 @@ def _dec_date_bin(b: bytes) -> _dt.date:
 
 def _dec_time_bin(b: bytes) -> _dt.time:
     (usec,) = _s_i64.unpack(b)
+    if not 0 <= usec < 86_400_000_000:  # PostgreSQL allows 24:00:00; Python's time does not
+        raise errors.DataError(f"can't decode time in binary format: {usec} microseconds is outside 00:00-23:59:59.999999")
     return (_dt.datetime(2000, 1, 1) + _dt.timedelta(microseconds=usec)).time()
 
 
@@ -182,7 +184,12 @@ def encode_scalar(value: Any, oid: int) -> bytes | None:
                        INT8: ("!q", -2**63, 2**63 - 1), OID: ("!I", 0, 2**32 - 1)}[oid]
         return struct.pack(fmt, value) if lo <= value <= hi else None
     if oid in (FLOAT4, FLOAT8) and isinstance(value, (int, float)) and not isinstance(value, bool):
-        return _s_f32.pack(value) if oid == FLOAT4 else _s_f64.pack(float(value))
+        if oid == FLOAT8:
+            return _s_f64.pack(float(value))
+        try:
+            return _s_f32.pack(value)
+        except OverflowError:  # beyond float4: the text form lets the server report it
+            return None
     if oid in (TEXT, VARCHAR, BPCHAR, NAME) and isinstance(value, str) and "\x00" not in value:
         return value.encode("utf-8")
     if oid == BYTEA and isinstance(value, (bytes, bytearray, memoryview)):

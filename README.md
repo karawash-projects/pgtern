@@ -31,7 +31,7 @@ asyncio.run(main())
 
 - **Nothing to audit but the code you run.** No transitive dependencies means no dependency tree to pin, scan or keep patched. The package is a small, readable, pure-Python wheel.
 - **Installs anywhere Python runs.** No compiler, no system libraries, no architecture-specific binaries. Containers, minimal images and locked-down hosts all get the same package.
-- **Secure by default, with stated limits.** The server must prove it knows the password before a SCRAM login is accepted. A password is never sent in plaintext unless you chose `sslmode=disable`, so a server that declines TLS under `prefer` cannot collect it. `verify-ca` and `verify-full` require a root certificate (`sslrootcert`), and fail rather than fall back to the system store. Channel binding (SCRAM-SHA-256-PLUS) is not implemented.
+- **Secure by default, with stated limits.** The server must prove it knows the password before a SCRAM login is accepted. A password is never sent in plaintext unless you chose `sslmode=disable`, so a server that declines TLS under `prefer` cannot collect it. `verify-ca` and `verify-full` require a root certificate (`sslrootcert`), and fail rather than fall back to the system store. Over TLS the login is bound to that connection with SCRAM-SHA-256-PLUS (`tls-server-end-point`, RFC 5929), so a login relayed through another connection fails.
 - **Blocking and async, one API.** The same concepts, names and behaviour in `pgtern` and `pgtern.aio`, including pools, transactions, COPY and notifications.
 - **Fast bulk writes.** `executemany` sends a whole batch as a single pipelined transaction. In measurements on PostgreSQL 16 it ran about five times faster than a row-by-row loop, both blocking and async.
 - **Built for modern deployments.** It uses unnamed prepared statements only, so it cooperates with transaction-mode connection poolers. Pools check connections before handing them out and replace any the server has closed.
@@ -52,7 +52,7 @@ Requires Python 3.11 or newer.
 conn = pgtern.connect("postgresql://app@db1.internal,db2.internal/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem")
 ```
 
-TLS modes follow the PostgreSQL convention: `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`. Authentication supports SCRAM-SHA-256, MD5, cleartext and trust. Under `allow` and `prefer` the client refuses MD5 and cleartext passwords on an unencrypted connection; under `disable` it sends them, because you asked for no encryption. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including trust. Failover moves to the next host on any startup failure, including timeouts during TLS negotiation. Passwords can come from a `.pgpass` file (`PGPASSFILE` or `~/.pgpass`); a file readable by other users is ignored, as the PostgreSQL client tools do. `target_session_attrs` (`read-write`, `read-only`, `primary`, `standby`, `prefer-standby`) skips servers that do not match, `hostaddr` connects to an address while keeping the host name for certificate checks, and `sslpassword` and `sslcrl` are supported.
+TLS modes follow the PostgreSQL convention: `disable`, `allow`, `prefer`, `require`, `verify-ca` and `verify-full`. Authentication supports SCRAM-SHA-256, MD5, cleartext and trust. Under `allow` and `prefer` the client refuses MD5 and cleartext passwords on an unencrypted connection; under `disable` it sends them, because you asked for no encryption. Set `require_auth=scram-sha-256` to refuse any server that does not use SCRAM, including trust. Failover moves to the next host on any startup failure, including timeouts during TLS negotiation. Passwords can come from a `.pgpass` file (`PGPASSFILE` or `~/.pgpass`); a file readable by other users is ignored, as the PostgreSQL client tools do. `target_session_attrs` (`read-write`, `read-only`, `primary`, `standby`, `prefer-standby`) skips servers that do not match, `hostaddr` connects to an address while keeping the host name for certificate checks, and `sslpassword` and `sslcrl` are supported. `connect_timeout` (default 30 seconds, `0` for no limit) bounds each attempt at one host, from the socket to the end of startup, so failover still reaches the next host.
 
 ## Queries and transactions
 
@@ -137,9 +137,21 @@ Python `int` parameters are sent as `int4`, `int8` or `numeric` by size. A `smal
 
 An interval with months or years decodes to `pgtern.Interval(months, delta)`, because a month is not a fixed number of days. Intervals without months decode to `timedelta`, as before.
 
+`timestamptz` values come back in UTC, in both text and binary format, so the two formats give the same value and the same `tzinfo`. `time` values written as `24:00:00` raise `DataError` in both formats, because Python has no such time. A `float4` parameter outside its range goes to the server as text, which reports the error.
+
+Dates and times follow the session's `DateStyle` and text the session's `client_encoding` as the server reports them after every `SET`. Text that cannot be sent in the session's encoding (non-ASCII text under a non-UTF-8 `client_encoding`) raises `NotSupportedError` before anything is sent.
+
+Placeholders are `%s` only. `%b` and `%t` are refused. `prepare=True` raises `NotSupportedError`, because statements always run unnamed; `prepare=False` is accepted.
+
+## Limits and safety
+
+`max_result_bytes` (a connection attribute, `None` by default) caps how many bytes of rows one statement may return. Past the cap, the rest of the reply is read and discarded, the connection stays usable, and the statement raises `DataError`. Results are otherwise held in memory, so stream large results with a server-side cursor.
+
+A query hook that fails on entry or exit is logged and ignored, so it never changes the result of a statement. A notice or notify handler that raises is logged too. Using the connection from inside a COPY block or from inside a handler raises `ProgrammingError` at once, instead of breaking the protocol or deadlocking.
+
 ## Forking
 
-A connection or pool must not be used across `fork()`. A forked child that uses an inherited connection gets `OperationalError`. A forked child that uses an inherited pool gets its own new connections, and never shares the parent's sockets.
+A connection must not be used across `fork()`: a forked child that uses an inherited connection gets `OperationalError`. A pool is different: after a fork, its first use in the child drops the parent's connections without closing them (a Terminate from the child would end the parent's sessions), then opens its own. Forked children never share the parent's sockets.
 
 ## Binary format and pipelines
 

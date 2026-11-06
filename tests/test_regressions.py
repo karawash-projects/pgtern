@@ -114,10 +114,11 @@ def test_failed_executemany_does_not_shift_later_results(dsn):
 
         remove = pgtern.add_query_hook(bad_on_exit)
         try:
-            with pytest.raises(RuntimeError, match="hook exit"):
-                c.cursor().executemany("INSERT INTO rg_em VALUES (%s)", [(i,) for i in range(5)])
+            # a hook failing on exit is logged and ignored: the batch completes, and nothing shifts
+            c.cursor().executemany("INSERT INTO rg_em VALUES (%s)", [(i,) for i in range(5)])
         finally:
             remove()
+        assert c.execute("SELECT count(*) FROM rg_em").fetchall() == [(5,)]
         assert c.execute("SELECT 42").fetchall() == [(42,)]
         assert c.execute("SELECT 43").fetchall() == [(43,)]
         assert c.execute("SELECT 44").fetchall() == [(44,)]

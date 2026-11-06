@@ -95,6 +95,7 @@ class Pipeline:
     # ---------------------------------------------------------------- block
     def __enter__(self) -> "Pipeline":
         conn = self._conn
+        conn._reentry_check()
         with conn._lock:
             conn._check_open()
             if conn._pipeline is not None:
@@ -126,6 +127,7 @@ class Pipeline:
     def execute(self, query: Any, params: Any = None) -> Cursor:
         """Queue a statement; returns a cursor that holds its result after the next sync."""
         conn = self._conn
+        conn._reentry_check()
         with conn._lock:
             conn._check_open()
             if not self._open:
@@ -142,6 +144,7 @@ class Pipeline:
                 self._begin_queued = True
             cursor = Cursor(conn)
             cursor._pipeline_pending = True
+            conn._before_send(sql, params)
             body = _encode(sql, params)
             conn._send(body)
             self._queued_bytes += len(body)
@@ -182,6 +185,7 @@ class Pipeline:
     def sync(self) -> None:
         """Send Sync, read every queued reply and fill in the cursors."""
         conn = self._conn
+        conn._reentry_check()
         with conn._lock:
             conn._check_open()
             items, self._queue = self._queue, []
@@ -247,7 +251,7 @@ class Pipeline:
     @staticmethod
     def _read_reply(conn: Any) -> tuple[list | None, errors.Error | None]:
         """Read one statement's messages. Returns (results, None), or (None, error)."""
-        collector = P.QueryCollector()
+        collector = P.QueryCollector(conn.max_result_bytes)
         while True:
             tag, payload = conn._next_message()
             if tag == 0x45:
@@ -258,7 +262,7 @@ class Pipeline:
                 return None, errors.error_from_fields(fields)
             if tag in (0x43, 0x49):  # C CommandComplete, I EmptyQueryResponse: this statement is done
                 collector.handle(tag, payload)
-                return collector.results, None
+                return (None, collector.error) if collector.error is not None else (collector.results, None)
             if tag in (0x4E, 0x53, 0x41):
                 conn._handle_async_message(tag, payload)
             else:

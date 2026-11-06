@@ -14,7 +14,7 @@ _PLACEHOLDER = re.compile(r"%(?:\(([^)]*)\))?(.?)", re.S)
 def translate(sql: str, params: Any, render: Any = None) -> tuple[str, list[Any]]:
     """Return ``(sql_with_$n, values)``.
 
-    ``%s``, ``%b`` and ``%t`` are placeholders and ``%%`` is a literal percent sign.
+    ``%s`` is the placeholder and ``%%`` is a literal percent sign.
     The query is scanned as plain text (string literals are not
     parsed), so a literal ``%`` inside a quoted string must be written ``%%``.
     With ``render`` (a function value -> SQL text) values are written into the SQL
@@ -43,9 +43,8 @@ def translate(sql: str, params: Any, render: Any = None) -> tuple[str, list[Any]
             continue
         if fmt == "":
             raise errors.ProgrammingError("incomplete placeholder: '%' at the end of the query")
-        if fmt not in ("s", "b", "t"):
-            raise errors.ProgrammingError(
-                f"only '%s', '%b', '%t' are allowed as placeholders, got '{m.group(0)}'")
+        if fmt != "s":
+            raise errors.ProgrammingError(f"only '%s' is a placeholder, got '{m.group(0)}'")
         if name is not None:
             if not named:
                 raise errors.ProgrammingError("named placeholders require a mapping of parameters")
@@ -59,6 +58,9 @@ def translate(sql: str, params: Any, render: Any = None) -> tuple[str, list[Any]
             if named:
                 raise errors.ProgrammingError("positional placeholders require a sequence of parameters")
             positional += 1
+            if not named and positional > len(params):
+                raise errors.ProgrammingError(
+                    f"the query has more placeholders than the {len(params)} parameters passed")
             out.append(f"${positional}" if render is None else render(params[positional - 1]))
     out.append(sql[last:])
     if not named:

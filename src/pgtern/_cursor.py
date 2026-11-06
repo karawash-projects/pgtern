@@ -74,6 +74,8 @@ class Cursor:
     # ---------------------------------------------------------------- execute
     def execute(self, query: Any, params: Any = None, *, prepare: bool | None = None,
                 binary: bool | None = None) -> "Cursor":
+        if prepare:
+            raise errors.NotSupportedError("prepare=True is not supported: pgtern runs statements unnamed")
         """Run a query. ``binary=True`` sends and receives binary format where the type supports
         it (one extra round trip). ``prepare`` is accepted for DB-API compatibility and ignored:
         pgtern always uses the unnamed statement."""
@@ -126,20 +128,20 @@ class Cursor:
             return None
         raw = cur.rows[self._pos]
         self._pos += 1
-        return self._make_row(load_row(raw, loaders))  # type: ignore[misc]
+        return self._make_row(load_row(raw, loaders, self.connection._codec))  # type: ignore[misc]
 
     def fetchmany(self, size: int | None = None) -> list:
         cur, loaders = self._prepare_rows()
         count = self.arraysize if size is None else size
         chunk = cur.rows[self._pos:self._pos + count]
         self._pos += len(chunk)
-        return [self._make_row(load_row(raw, loaders)) for raw in chunk]  # type: ignore[misc]
+        return [self._make_row(load_row(raw, loaders, self.connection._codec)) for raw in chunk]  # type: ignore[misc]
 
     def fetchall(self) -> list:
         cur, loaders = self._prepare_rows()
         chunk = cur.rows[self._pos:]
         self._pos = len(cur.rows)
-        return [self._make_row(load_row(raw, loaders)) for raw in chunk]  # type: ignore[misc]
+        return [self._make_row(load_row(raw, loaders, self.connection._codec)) for raw in chunk]  # type: ignore[misc]
 
     def __iter__(self) -> Iterator:
         return self

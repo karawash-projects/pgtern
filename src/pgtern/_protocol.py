@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 import struct
-from typing import NamedTuple, Sequence
+from collections.abc import Mapping
+from typing import Any, NamedTuple, Sequence
 
 from . import errors
 
@@ -34,6 +35,18 @@ def startup_message(params: dict[str, str]) -> bytes:
 
 def query_message(sql: str) -> bytes:
     return _msg(b"Q", _checked(sql).encode() + b"\0")
+
+
+def check_encodable(codec: str, sql: str, params: Any = None) -> None:
+    """Outgoing text is sent as UTF-8. Under another client_encoding the server reads it in that
+    encoding, so only ASCII text is safe to send. Reading still uses the session encoding."""
+    if codec == "utf-8":
+        return
+    values = params.values() if isinstance(params, Mapping) else (params or ())
+    if not sql.isascii() or any(isinstance(v, str) and not v.isascii() for v in values):
+        raise errors.NotSupportedError(
+            f"non-ASCII text can't be sent while client_encoding is {codec}: "
+            "SET client_encoding TO UTF8 first")
 
 
 def _checked(sql: str) -> str:
@@ -248,11 +261,18 @@ class Result:
 
 
 class QueryCollector:
-    """Builds the list of results of one query cycle from backend messages."""
+    """Builds the list of results of one query cycle from backend messages.
 
-    def __init__(self) -> None:
+    With ``max_bytes`` set, rows beyond that many bytes are dropped and ``error`` says so. The caller
+    still reads the reply to ReadyForQuery, so the connection stays usable.
+    """
+
+    def __init__(self, max_bytes: int | None = None) -> None:
         self.results: list[Result] = []
         self._current: Result | None = None
+        self._budget = max_bytes
+        self._used = 0
+        self.error: errors.DataError | None = None
 
     def handle(self, tag: int, payload: bytes) -> None:
         if tag == 0x54:  # T RowDescription
@@ -260,6 +280,13 @@ class QueryCollector:
         elif tag == 0x44:  # D DataRow
             if self._current is None:
                 self._current = Result()
+            if self._budget is not None:
+                self._used += len(payload)
+                if self._used > self._budget:
+                    if self.error is None:
+                        self.error = errors.DataError(
+                            f"the result is larger than max_result_bytes ({self._budget} bytes)")
+                    return
             self._current.rows.append(parse_data_row(payload))
         elif tag == 0x43:  # C CommandComplete
             res = self._current or Result()
