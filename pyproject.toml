@@ -27,6 +27,12 @@ classifiers = [
 # Zero runtime dependencies: the standard library is all pgtern needs.
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/karawash-projects/pgtern"
+Source = "https://github.com/karawash-projects/pgtern"
+Issues = "https://github.com/karawash-projects/pgtern/issues"
+Changelog = "https://github.com/karawash-projects/pgtern/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-timeout>=2", "build>=1.2", "pyflakes>=3", "mypy>=1.10"]
 

@@ -1,9 +1,11 @@
 # pgtern
 
 [![CI](https://github.com/karawash-projects/pgtern/actions/workflows/ci.yml/badge.svg)](https://github.com/karawash-projects/pgtern/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/karawash-projects/pgtern/blob/main/LICENSE)
 
 pgtern is a PostgreSQL client for Python. It speaks the PostgreSQL wire protocol directly and uses only the Python standard library, so there are no runtime dependencies, no C extensions and no build step. It provides a DB-API style interface in two forms: blocking, and `asyncio`.
+
+> **Status: Beta.** pgtern is at version 0.x. The API may change before 1.0; changes are listed in the [CHANGELOG](https://github.com/karawash-projects/pgtern/blob/main/CHANGELOG.md).
 
 ```python
 import pgtern
@@ -136,7 +138,7 @@ Server-side cursors support `scrollable`, `withhold` and `scroll()`.
 ## Notifications
 
 ```python
-with pgtern.connect(dsn) as conn:
+with pgtern.connect(dsn, autocommit=True) as conn:   # LISTEN takes effect at once only in autocommit
     conn.execute("LISTEN orders")
     for note in conn.notifies(timeout=30):
         print(note.channel, note.payload)
@@ -249,7 +251,7 @@ with pgtern.connect(dsn) as conn:
 
 - **PostgreSQL:** 14, 15, 16, 17 and 18.
 - **Python:** 3.11, 3.12 and 3.13 are tested in continuous integration.
-- **Platforms:** anywhere CPython runs.
+- **Platforms:** tested on Linux. Unix sockets, `fork()` and `.pgpass` permission checks behave differently on Windows, so check those yourself there.
 
 ## Development
 

@@ -7,7 +7,7 @@ these in mind when you propose a change.
 ## Getting started
 
 ```
-git clone <repository-url> pgtern
+git clone https://github.com/karawash-projects/pgtern.git pgtern
 cd pgtern
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
